@@ -1,0 +1,35 @@
+# Smart City AI Agent - .gitignore
+
+# ── Environment ───────────────────────────────────────────
+.env
+venv/
+.venv/
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── IDE ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Testing ───────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ── Cache ─────────────────────────────────────────────────
+*.cache
+.cache/

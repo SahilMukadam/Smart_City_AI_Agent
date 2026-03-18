@@ -1,0 +1,35 @@
+#Gemini-api key
+https://aistudio.google.com/api-keys?project=gen-lang-client-0134199519
+
+#To initiate a venv terminal we need to use the following commands
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+.\venv\Scripts\Activate.ps1
+
+#Step — Test the server:
+powershelluvicorn src.api.main:app --reload --port 8000
+
+- Open your browser and go to:
+
+http://localhost:8000 — should show app info JSON
+http://localhost:8000/health — should show {"status": "healthy"}
+http://localhost:8000/docs — should show Swagger UI (interactive API docs)
+
+Press Ctrl+C in the terminal to stop the server.
+
+
+# to do tasks
+- control history limits from last 10 chats to more 
+- pop up message if api rate limits are crossed 
+- show me the structure of how flies are connected/invoked. basically i want to know the wokrflow tree
+- based on the RAG memory uploaded i want it to understand the data and ask me questions if i ask for it 
+  the model fails to give summary of the document when asked. it says no such data found. which means 
+  the document is answering me to my questions based on individual chunks of data and not co-relating the chunks and finding meaning in them.
+  maybe if i set it to "self.vector_store.search(query=question,k=k,source_filters=None,)". then it may resolve
+
+
+#######
+- In the UI when minimising to left show minimised icons similar to the claude ai chats 
+- how to clear all data to make the app fresh to use ?
+- i want the model be able to read the following files : .txt, .md, .json, .yaml, .yml, .pdf, .docx, .doc, .xml, .html, .htm

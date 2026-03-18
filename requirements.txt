@@ -1,0 +1,25 @@
+# Smart City AI Agent - Requirements
+# Day 1: Core + TfL wrapper
+
+# ── Web Framework ─────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# ── HTTP Client ───────────────────────────────────────────
+httpx>=0.25.0
+
+# ── Config & Validation ──────────────────────────────────
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# ── Testing ───────────────────────────────────────────────
+pytest>=7.4.0
+
+# ── Day 2+ (uncomment as needed) ─────────────────────────
+# langgraph>=0.2.0
+# langchain-core>=0.3.0
+# langchain-google-genai>=2.0.0
+# folium>=0.15.0
+# plotly>=5.18.0
+# streamlit>=1.29.0
