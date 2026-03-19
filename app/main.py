@@ -1,7 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 1: Health check + TfL diagnostic endpoints.
-More endpoints added as tools are built.
+Day 2: TfL + Weather + Air Quality endpoints.
 """
 
 import logging
@@ -12,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.tools.tfl import TfLTool
+from app.tools.weather import WeatherTool
+from app.tools.air_quality import AirQualityTool
 
 # ── Logging Setup ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,13 +39,13 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Streamlit frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,6 +53,8 @@ app.add_middleware(
 
 # ── Tool Instances ────────────────────────────────────────────────
 tfl_tool = TfLTool()
+weather_tool = WeatherTool()
+air_quality_tool = AirQualityTool()
 
 
 # ── Health Check ──────────────────────────────────────────────────
@@ -61,12 +64,14 @@ def health_check():
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.1.0",
-        "tools_available": ["tfl"],
+        "version": "0.2.0",
+        "tools_available": ["tfl", "weather", "air_quality"],
     }
 
 
-# ── TfL Endpoints (diagnostic / testing) ─────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# TfL Endpoints
+# ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/tfl/tube-status")
 def get_tube_status():
@@ -102,10 +107,7 @@ def get_road_status(
 
 @app.get("/api/tfl/summary")
 def get_tfl_summary():
-    """
-    Quick summary of all TfL data - tube + disruptions + roads.
-    Useful for the agent to get a full picture in one call.
-    """
+    """Quick summary of all TfL data."""
     tube = tfl_tool.get_tube_status()
     disruptions = tfl_tool.get_road_disruptions()
 
@@ -119,6 +121,124 @@ def get_tfl_summary():
             "success": disruptions.success,
             "summary": disruptions.summary,
             "total_count": disruptions.data.get("total_count", 0) if disruptions.data else 0,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# Weather Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/weather/current")
+def get_current_weather(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+):
+    """Fetch current weather conditions."""
+    result = weather_tool.get_current_weather(latitude=lat, longitude=lon)
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/weather/forecast")
+def get_weather_forecast(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+    hours: int = Query(default=12, description="Forecast hours (max 48)", ge=1, le=48),
+):
+    """Fetch hourly weather forecast."""
+    result = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=hours)
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/weather/summary")
+def get_weather_summary(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+):
+    """Quick summary: current weather + 6-hour forecast."""
+    current = weather_tool.get_current_weather(latitude=lat, longitude=lon)
+    forecast = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=6)
+
+    return {
+        "current": {
+            "success": current.success,
+            "summary": current.summary,
+            "data": current.data if current.success else None,
+        },
+        "forecast_6h": {
+            "success": forecast.success,
+            "summary": forecast.summary,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# Air Quality Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/air-quality/stations")
+def get_nearby_stations(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+    radius: int = Query(default=10000, description="Search radius in meters"),
+):
+    """Find air quality monitoring stations nearby."""
+    result = air_quality_tool.get_nearby_stations(
+        latitude=lat, longitude=lon, radius_meters=radius
+    )
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/air-quality/latest")
+def get_air_quality_latest(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+    radius: int = Query(default=10000, description="Search radius in meters"),
+):
+    """Fetch latest air quality readings from nearby stations."""
+    result = air_quality_tool.get_latest_readings(
+        latitude=lat, longitude=lon, radius_meters=radius
+    )
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+# ══════════════════════════════════════════════════════════════════
+# City Overview Endpoint (all data sources)
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/city/overview")
+def get_city_overview(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+):
+    """
+    Full city overview: TfL + Weather + Air Quality in one call.
+    This is what the agent will use to get a quick snapshot.
+    """
+    tube = tfl_tool.get_tube_status()
+    weather = weather_tool.get_current_weather(latitude=lat, longitude=lon)
+    air = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon)
+
+    return {
+        "tube": {
+            "success": tube.success,
+            "summary": tube.summary,
+        },
+        "weather": {
+            "success": weather.success,
+            "summary": weather.summary,
+        },
+        "air_quality": {
+            "success": air.success,
+            "summary": air.summary,
         },
     }
 

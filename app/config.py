@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # ── OpenAQ (Day 2, free, no key needed) ──────────────────────
     OPENAQ_BASE_URL: str = "https://api.openaq.org/v3"
+    OPENAQ_API_KEY: str = ""
 
     # ── Google Gemini (Day 4) ────────────────────────────────────
     GEMINI_API_KEY: str = ""
