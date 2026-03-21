@@ -1,6 +1,7 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 2: TfL + Weather + Air Quality endpoints.
+Day 3: TfL + Weather + Air Quality + TomTom endpoints.
+All 4 data sources available.
 """
 
 import logging
@@ -13,6 +14,7 @@ from app.config import get_settings
 from app.tools.tfl import TfLTool
 from app.tools.weather import WeatherTool
 from app.tools.air_quality import AirQualityTool
+from app.tools.tomtom import TomTomTool, LONDON_POINTS
 
 # ── Logging Setup ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -29,6 +31,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME}")
     logger.info(f"Debug mode: {settings.DEBUG}")
     logger.info(f"TfL API key configured: {bool(settings.TFL_APP_KEY)}")
+    logger.info(f"TomTom API key configured: {bool(settings.TOMTOM_API_KEY)}")
     yield
     logger.info("Shutting down.")
 
@@ -39,7 +42,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -55,6 +58,7 @@ app.add_middleware(
 tfl_tool = TfLTool()
 weather_tool = WeatherTool()
 air_quality_tool = AirQualityTool()
+tomtom_tool = TomTomTool()
 
 
 # ── Health Check ──────────────────────────────────────────────────
@@ -64,8 +68,9 @@ def health_check():
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.2.0",
-        "tools_available": ["tfl", "weather", "air_quality"],
+        "version": "0.3.0",
+        "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
+        "tomtom_configured": bool(settings.TOMTOM_API_KEY),
     }
 
 
@@ -211,6 +216,58 @@ def get_air_quality_latest(
 
 
 # ══════════════════════════════════════════════════════════════════
+# TomTom Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/tomtom/flow")
+def get_traffic_flow(
+    lat: float = Query(default=51.5074, description="Latitude"),
+    lon: float = Query(default=-0.1278, description="Longitude"),
+    name: str | None = Query(default=None, description="Location name for display"),
+):
+    """Fetch real-time traffic flow at a specific point."""
+    result = tomtom_tool.get_traffic_flow(
+        latitude=lat, longitude=lon, location_name=name
+    )
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/tomtom/multi-flow")
+def get_multi_point_flow(
+    points: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated location keys "
+            "(e.g., 'central,city,canary_wharf'). Omit for all."
+        ),
+    ),
+):
+    """Fetch traffic flow at multiple London locations."""
+    point_list = points.split(",") if points else None
+    result = tomtom_tool.get_multi_point_flow(points=point_list)
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/tomtom/incidents")
+def get_traffic_incidents():
+    """Fetch traffic incidents across Greater London."""
+    result = tomtom_tool.get_traffic_incidents()
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error)
+    return result.model_dump()
+
+
+@app.get("/api/tomtom/points")
+def get_available_points():
+    """List all predefined London monitoring points."""
+    return TomTomTool.get_available_points()
+
+
+# ══════════════════════════════════════════════════════════════════
 # City Overview Endpoint (all data sources)
 # ══════════════════════════════════════════════════════════════════
 
@@ -220,12 +277,13 @@ def get_city_overview(
     lon: float = Query(default=-0.1278, description="Longitude"),
 ):
     """
-    Full city overview: TfL + Weather + Air Quality in one call.
+    Full city overview: TfL + Weather + Air Quality + TomTom in one call.
     This is what the agent will use to get a quick snapshot.
     """
     tube = tfl_tool.get_tube_status()
     weather = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     air = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon)
+    traffic = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon)
 
     return {
         "tube": {
@@ -239,6 +297,10 @@ def get_city_overview(
         "air_quality": {
             "success": air.success,
             "summary": air.summary,
+        },
+        "traffic_flow": {
+            "success": traffic.success,
+            "summary": traffic.summary,
         },
     }
 
