@@ -1,7 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 3: TfL + Weather + Air Quality + TomTom endpoints.
-All 4 data sources available.
+Day 4: All data source endpoints + LangGraph agent chat endpoint.
 """
 
 import logging
@@ -9,12 +8,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.tools.tfl import TfLTool
 from app.tools.weather import WeatherTool
 from app.tools.air_quality import AirQualityTool
-from app.tools.tomtom import TomTomTool, LONDON_POINTS
+from app.tools.tomtom import TomTomTool
+from app.agent.graph import create_agent
 
 # ── Logging Setup ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -23,15 +24,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Global agent instance ─────────────────────────────────────────
+agent = None
+
 # ── Lifespan (startup / shutdown) ─────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
+    global agent
     settings = get_settings()
     logger.info(f"Starting {settings.APP_NAME}")
     logger.info(f"Debug mode: {settings.DEBUG}")
-    logger.info(f"TfL API key configured: {bool(settings.TFL_APP_KEY)}")
-    logger.info(f"TomTom API key configured: {bool(settings.TOMTOM_API_KEY)}")
+
+    # Initialize agent
+    if settings.GEMINI_API_KEY:
+        agent = create_agent()
+        logger.info("✅ LangGraph agent initialized")
+    else:
+        logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
+
     yield
     logger.info("Shutting down.")
 
@@ -42,7 +53,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -61,6 +72,88 @@ air_quality_tool = AirQualityTool()
 tomtom_tool = TomTomTool()
 
 
+# ── Request/Response Models ───────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    """Request body for agent chat."""
+    message: str = Field(
+        description="User's question about London city conditions",
+        min_length=1,
+        max_length=1000,
+    )
+
+
+class ChatResponse(BaseModel):
+    """Response from the agent."""
+    response: str = Field(description="Agent's analysis and answer")
+    tools_used: list[str] = Field(description="Tools the agent called")
+    success: bool = Field(description="Whether the agent completed successfully")
+    error: str | None = Field(default=None, description="Error message if failed")
+
+
+# ══════════════════════════════════════════════════════════════════
+# Agent Chat Endpoint
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/agent/chat", response_model=ChatResponse)
+def agent_chat(request: ChatRequest):
+    """
+    Send a question to the Smart City AI Agent.
+    The agent will:
+    1. Analyze your question
+    2. Decide which data sources to query
+    3. Fetch real-time data
+    4. Correlate and analyze the results
+    5. Return an insightful answer
+    """
+    if agent is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent not available. Set GEMINI_API_KEY in .env",
+        )
+
+    logger.info(f"📨 Agent chat: {request.message[:100]}...")
+
+    try:
+        # Invoke the LangGraph agent
+        result = agent.invoke({
+            "messages": [("user", request.message)],
+            "tools_to_call": [],
+            "tool_results": {},
+            "analysis": "",
+            "iteration_count": 0,
+            "error": "",
+        })
+
+        # Extract the final AI message
+        messages = result.get("messages", [])
+        ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
+
+        if ai_messages:
+            response_text = ai_messages[-1].content
+        else:
+            response_text = result.get("analysis", "No response generated.")
+
+        tools_used = result.get("tools_to_call", [])
+        error = result.get("error", "")
+
+        return ChatResponse(
+            response=response_text,
+            tools_used=tools_used,
+            success=True,
+            error=error if error else None,
+        )
+
+    except Exception as e:
+        logger.error(f"Agent error: {e}")
+        return ChatResponse(
+            response=f"Sorry, I encountered an error: {str(e)}",
+            tools_used=[],
+            success=False,
+            error=str(e),
+        )
+
+
 # ── Health Check ──────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
@@ -68,9 +161,9 @@ def health_check():
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.3.0",
+        "version": "0.4.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
-        "tomtom_configured": bool(settings.TOMTOM_API_KEY),
+        "agent_ready": agent is not None,
     }
 
 
@@ -80,7 +173,6 @@ def health_check():
 
 @app.get("/api/tfl/tube-status")
 def get_tube_status():
-    """Fetch current status of all London Underground lines."""
     result = tfl_tool.get_tube_status()
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -89,7 +181,6 @@ def get_tube_status():
 
 @app.get("/api/tfl/disruptions")
 def get_disruptions():
-    """Fetch all current road disruptions across London."""
     result = tfl_tool.get_road_disruptions()
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -98,12 +189,8 @@ def get_disruptions():
 
 @app.get("/api/tfl/road-status")
 def get_road_status(
-    road_ids: str | None = Query(
-        default=None,
-        description="Comma-separated road IDs (e.g., 'A1,A2,A40'). Omit for all roads.",
-    ),
+    road_ids: str | None = Query(default=None),
 ):
-    """Fetch status of major road corridors."""
     result = tfl_tool.get_road_status(road_ids=road_ids)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -112,21 +199,11 @@ def get_road_status(
 
 @app.get("/api/tfl/summary")
 def get_tfl_summary():
-    """Quick summary of all TfL data."""
     tube = tfl_tool.get_tube_status()
     disruptions = tfl_tool.get_road_disruptions()
-
     return {
-        "tube_status": {
-            "success": tube.success,
-            "summary": tube.summary,
-            "disrupted_count": tube.data.get("disrupted_count", 0) if tube.data else 0,
-        },
-        "road_disruptions": {
-            "success": disruptions.success,
-            "summary": disruptions.summary,
-            "total_count": disruptions.data.get("total_count", 0) if disruptions.data else 0,
-        },
+        "tube_status": {"success": tube.success, "summary": tube.summary},
+        "road_disruptions": {"success": disruptions.success, "summary": disruptions.summary},
     }
 
 
@@ -136,10 +213,9 @@ def get_tfl_summary():
 
 @app.get("/api/weather/current")
 def get_current_weather(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
 ):
-    """Fetch current weather conditions."""
     result = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -148,11 +224,10 @@ def get_current_weather(
 
 @app.get("/api/weather/forecast")
 def get_weather_forecast(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
-    hours: int = Query(default=12, description="Forecast hours (max 48)", ge=1, le=48),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
+    hours: int = Query(default=12, ge=1, le=48),
 ):
-    """Fetch hourly weather forecast."""
     result = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=hours)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -161,23 +236,14 @@ def get_weather_forecast(
 
 @app.get("/api/weather/summary")
 def get_weather_summary(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
 ):
-    """Quick summary: current weather + 6-hour forecast."""
     current = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     forecast = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=6)
-
     return {
-        "current": {
-            "success": current.success,
-            "summary": current.summary,
-            "data": current.data if current.success else None,
-        },
-        "forecast_6h": {
-            "success": forecast.success,
-            "summary": forecast.summary,
-        },
+        "current": {"success": current.success, "summary": current.summary, "data": current.data if current.success else None},
+        "forecast_6h": {"success": forecast.success, "summary": forecast.summary},
     }
 
 
@@ -187,14 +253,11 @@ def get_weather_summary(
 
 @app.get("/api/air-quality/stations")
 def get_nearby_stations(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
-    radius: int = Query(default=10000, description="Search radius in meters"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
+    radius: int = Query(default=10000),
 ):
-    """Find air quality monitoring stations nearby."""
-    result = air_quality_tool.get_nearby_stations(
-        latitude=lat, longitude=lon, radius_meters=radius
-    )
+    result = air_quality_tool.get_nearby_stations(latitude=lat, longitude=lon, radius_meters=radius)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
@@ -202,14 +265,11 @@ def get_nearby_stations(
 
 @app.get("/api/air-quality/latest")
 def get_air_quality_latest(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
-    radius: int = Query(default=10000, description="Search radius in meters"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
+    radius: int = Query(default=10000),
 ):
-    """Fetch latest air quality readings from nearby stations."""
-    result = air_quality_tool.get_latest_readings(
-        latitude=lat, longitude=lon, radius_meters=radius
-    )
+    result = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon, radius_meters=radius)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
@@ -221,14 +281,11 @@ def get_air_quality_latest(
 
 @app.get("/api/tomtom/flow")
 def get_traffic_flow(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
-    name: str | None = Query(default=None, description="Location name for display"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
+    name: str | None = Query(default=None),
 ):
-    """Fetch real-time traffic flow at a specific point."""
-    result = tomtom_tool.get_traffic_flow(
-        latitude=lat, longitude=lon, location_name=name
-    )
+    result = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon, location_name=name)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
@@ -236,15 +293,8 @@ def get_traffic_flow(
 
 @app.get("/api/tomtom/multi-flow")
 def get_multi_point_flow(
-    points: str | None = Query(
-        default=None,
-        description=(
-            "Comma-separated location keys "
-            "(e.g., 'central,city,canary_wharf'). Omit for all."
-        ),
-    ),
+    points: str | None = Query(default=None),
 ):
-    """Fetch traffic flow at multiple London locations."""
     point_list = points.split(",") if points else None
     result = tomtom_tool.get_multi_point_flow(points=point_list)
     if not result.success:
@@ -254,7 +304,6 @@ def get_multi_point_flow(
 
 @app.get("/api/tomtom/incidents")
 def get_traffic_incidents():
-    """Fetch traffic incidents across Greater London."""
     result = tomtom_tool.get_traffic_incidents()
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -263,55 +312,31 @@ def get_traffic_incidents():
 
 @app.get("/api/tomtom/points")
 def get_available_points():
-    """List all predefined London monitoring points."""
     return TomTomTool.get_available_points()
 
 
 # ══════════════════════════════════════════════════════════════════
-# City Overview Endpoint (all data sources)
+# City Overview
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/city/overview")
 def get_city_overview(
-    lat: float = Query(default=51.5074, description="Latitude"),
-    lon: float = Query(default=-0.1278, description="Longitude"),
+    lat: float = Query(default=51.5074),
+    lon: float = Query(default=-0.1278),
 ):
-    """
-    Full city overview: TfL + Weather + Air Quality + TomTom in one call.
-    This is what the agent will use to get a quick snapshot.
-    """
     tube = tfl_tool.get_tube_status()
     weather = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     air = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon)
     traffic = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon)
-
     return {
-        "tube": {
-            "success": tube.success,
-            "summary": tube.summary,
-        },
-        "weather": {
-            "success": weather.success,
-            "summary": weather.summary,
-        },
-        "air_quality": {
-            "success": air.success,
-            "summary": air.summary,
-        },
-        "traffic_flow": {
-            "success": traffic.success,
-            "summary": traffic.summary,
-        },
+        "tube": {"success": tube.success, "summary": tube.summary},
+        "weather": {"success": weather.success, "summary": weather.summary},
+        "air_quality": {"success": air.success, "summary": air.summary},
+        "traffic_flow": {"success": traffic.success, "summary": traffic.summary},
     }
 
 
 # ── Run directly ──────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        "app.main:app",
-        host=settings.API_HOST,
-        port=settings.API_PORT,
-        reload=settings.DEBUG,
-    )
+    uvicorn.run("app.main:app", host=settings.API_HOST, port=settings.API_PORT, reload=settings.DEBUG)
