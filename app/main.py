@@ -1,6 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 4: All data source endpoints + LangGraph agent chat endpoint.
+Day 5: Parallel tool execution + conditional routing.
 """
 
 import logging
@@ -30,16 +30,13 @@ agent = None
 # ── Lifespan (startup / shutdown) ─────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
     global agent
     settings = get_settings()
     logger.info(f"Starting {settings.APP_NAME}")
-    logger.info(f"Debug mode: {settings.DEBUG}")
 
-    # Initialize agent
     if settings.GEMINI_API_KEY:
         agent = create_agent()
-        logger.info("✅ LangGraph agent initialized")
+        logger.info("✅ LangGraph agent initialized (parallel + conditional routing)")
     else:
         logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
 
@@ -53,7 +50,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -75,7 +72,6 @@ tomtom_tool = TomTomTool()
 # ── Request/Response Models ───────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    """Request body for agent chat."""
     message: str = Field(
         description="User's question about London city conditions",
         min_length=1,
@@ -84,7 +80,6 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Response from the agent."""
     response: str = Field(description="Agent's analysis and answer")
     tools_used: list[str] = Field(description="Tools the agent called")
     success: bool = Field(description="Whether the agent completed successfully")
@@ -99,12 +94,8 @@ class ChatResponse(BaseModel):
 def agent_chat(request: ChatRequest):
     """
     Send a question to the Smart City AI Agent.
-    The agent will:
-    1. Analyze your question
-    2. Decide which data sources to query
-    3. Fetch real-time data
-    4. Correlate and analyze the results
-    5. Return an insightful answer
+    The agent will autonomously decide which data sources to query,
+    fetch real-time data in parallel, and return an analyzed response.
     """
     if agent is None:
         raise HTTPException(
@@ -115,10 +106,10 @@ def agent_chat(request: ChatRequest):
     logger.info(f"📨 Agent chat: {request.message[:100]}...")
 
     try:
-        # Invoke the LangGraph agent
         result = agent.invoke({
             "messages": [("user", request.message)],
             "tools_to_call": [],
+            "tool_arguments": {},
             "tool_results": {},
             "analysis": "",
             "iteration_count": 0,
@@ -157,13 +148,13 @@ def agent_chat(request: ChatRequest):
 # ── Health Check ──────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
-    """Health check endpoint."""
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.4.0",
+        "version": "0.5.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
         "agent_ready": agent is not None,
+        "features": ["parallel_execution", "conditional_routing", "argument_extraction"],
     }
 
 
@@ -188,9 +179,7 @@ def get_disruptions():
 
 
 @app.get("/api/tfl/road-status")
-def get_road_status(
-    road_ids: str | None = Query(default=None),
-):
+def get_road_status(road_ids: str | None = Query(default=None)):
     result = tfl_tool.get_road_status(road_ids=road_ids)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -212,10 +201,7 @@ def get_tfl_summary():
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/weather/current")
-def get_current_weather(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-):
+def get_current_weather(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     result = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
@@ -235,10 +221,7 @@ def get_weather_forecast(
 
 
 @app.get("/api/weather/summary")
-def get_weather_summary(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-):
+def get_weather_summary(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     current = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     forecast = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=6)
     return {
@@ -292,9 +275,7 @@ def get_traffic_flow(
 
 
 @app.get("/api/tomtom/multi-flow")
-def get_multi_point_flow(
-    points: str | None = Query(default=None),
-):
+def get_multi_point_flow(points: str | None = Query(default=None)):
     point_list = points.split(",") if points else None
     result = tomtom_tool.get_multi_point_flow(points=point_list)
     if not result.success:
@@ -320,10 +301,7 @@ def get_available_points():
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/city/overview")
-def get_city_overview(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-):
+def get_city_overview(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     tube = tfl_tool.get_tube_status()
     weather = weather_tool.get_current_weather(latitude=lat, longitude=lon)
     air = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon)

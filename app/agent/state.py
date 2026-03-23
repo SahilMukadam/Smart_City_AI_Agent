@@ -1,5 +1,5 @@
 """
-Smart City AI Agent - Agent State Definition
+Smart City AI Agent - Agent State Definition (Day 5)
 The state object that flows through every node in the LangGraph.
 """
 
@@ -17,17 +17,22 @@ class CityAgentState(TypedDict):
     """
 
     # ── Conversation ──────────────────────────────────────────────
-    # Full message history. `add_messages` annotation means new messages
-    # are APPENDED, not replaced. This preserves conversation context.
     messages: Annotated[list, add_messages]
 
     # ── Tool Selection ────────────────────────────────────────────
-    # Which tools the router decided to call (e.g., ["get_tube_status", "get_current_weather"])
+    # Which tools the router decided to call
+    # e.g., ["get_tube_status", "get_current_weather"]
     tools_to_call: list[str]
+
+    # ── Tool Arguments ────────────────────────────────────────────
+    # Arguments for each tool call, keyed by tool name
+    # e.g., {"get_traffic_flow": {"latitude": 51.50, "longitude": -0.07}}
+    # May include suffixed keys for duplicate tools:
+    # e.g., {"get_traffic_flow__1": {...}, "get_traffic_flow__2": {...}}
+    tool_arguments: dict[str, dict]
 
     # ── Tool Results ──────────────────────────────────────────────
     # Results from each tool call, keyed by tool name
-    # e.g., {"get_tube_status": "...", "get_current_weather": "..."}
     tool_results: dict[str, str]
 
     # ── Analysis ──────────────────────────────────────────────────
@@ -35,8 +40,5 @@ class CityAgentState(TypedDict):
     analysis: str
 
     # ── Metadata ──────────────────────────────────────────────────
-    # Number of tool-calling iterations so far (safety limit)
     iteration_count: int
-
-    # Error message if something went wrong
     error: str

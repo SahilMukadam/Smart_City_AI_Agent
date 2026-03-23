@@ -2,3 +2,8 @@
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\venv\Scripts\Activate.ps1
+
+
+# to add changes at the end:
+1. the location should be selected based on the coordinates. the bbox should be able to be configured the the config or the .env file.
+   I dont want there to be many places where i change the lat and lon 
