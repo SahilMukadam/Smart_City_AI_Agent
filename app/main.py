@@ -1,6 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 5: Parallel tool execution + conditional routing.
+Day 6: Full agent with conversation memory + session management.
 """
 
 import logging
@@ -16,6 +16,7 @@ from app.tools.weather import WeatherTool
 from app.tools.air_quality import AirQualityTool
 from app.tools.tomtom import TomTomTool
 from app.agent.graph import create_agent
+from app.agent.sessions import SessionManager
 
 # ── Logging Setup ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -24,10 +25,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Global agent instance ─────────────────────────────────────────
+# ── Globals ───────────────────────────────────────────────────────
 agent = None
+session_manager = SessionManager(session_ttl_seconds=1800, max_sessions=100)
 
-# ── Lifespan (startup / shutdown) ─────────────────────────────────
+# ── Lifespan ──────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent
@@ -36,7 +38,7 @@ async def lifespan(app: FastAPI):
 
     if settings.GEMINI_API_KEY:
         agent = create_agent()
-        logger.info("✅ LangGraph agent initialized (parallel + conditional routing)")
+        logger.info("✅ LangGraph agent initialized (parallel + conditional + memory)")
     else:
         logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
 
@@ -50,7 +52,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -77,25 +79,44 @@ class ChatRequest(BaseModel):
         min_length=1,
         max_length=1000,
     )
+    session_id: str | None = Field(
+        default=None,
+        description="Session ID for conversation continuity. "
+        "Omit to start a new session.",
+    )
 
 
 class ChatResponse(BaseModel):
     response: str = Field(description="Agent's analysis and answer")
     tools_used: list[str] = Field(description="Tools the agent called")
+    session_id: str = Field(description="Session ID for follow-up queries")
     success: bool = Field(description="Whether the agent completed successfully")
     error: str | None = Field(default=None, description="Error message if failed")
 
 
+class SessionInfo(BaseModel):
+    session_id: str
+    created_at: str
+    total_messages: int
+    total_queries: int
+    tools_used: list[str]
+    is_expired: bool
+
+
 # ══════════════════════════════════════════════════════════════════
-# Agent Chat Endpoint
+# Agent Chat Endpoint (with session memory)
 # ══════════════════════════════════════════════════════════════════
 
 @app.post("/api/agent/chat", response_model=ChatResponse)
 def agent_chat(request: ChatRequest):
     """
     Send a question to the Smart City AI Agent.
-    The agent will autonomously decide which data sources to query,
-    fetch real-time data in parallel, and return an analyzed response.
+
+    Include a `session_id` from a previous response to continue a conversation.
+    The agent will remember previous questions and use them as context for
+    follow-up queries.
+
+    Omit `session_id` to start a fresh conversation.
     """
     if agent is None:
         raise HTTPException(
@@ -105,9 +126,23 @@ def agent_chat(request: ChatRequest):
 
     logger.info(f"📨 Agent chat: {request.message[:100]}...")
 
+    # Get or create session
+    session = session_manager.get_or_create_session(request.session_id)
+    logger.info(
+        f"📝 Session: {session.session_id} "
+        f"(history: {len(session.messages)} messages)"
+    )
+
+    # Add user message to session history
+    session.add_user_message(request.message)
+
     try:
+        # Build message history for the agent
+        # Include previous conversation messages for context
+        history_messages = session.get_recent_messages(max_messages=10)
+
         result = agent.invoke({
-            "messages": [("user", request.message)],
+            "messages": history_messages,
             "tools_to_call": [],
             "tool_arguments": {},
             "tool_results": {},
@@ -128,21 +163,86 @@ def agent_chat(request: ChatRequest):
         tools_used = result.get("tools_to_call", [])
         error = result.get("error", "")
 
+        # Store AI response and tools in session
+        session.add_ai_message(response_text)
+        session.add_tools_used(tools_used)
+
         return ChatResponse(
             response=response_text,
             tools_used=tools_used,
+            session_id=session.session_id,
             success=True,
             error=error if error else None,
         )
 
     except Exception as e:
         logger.error(f"Agent error: {e}")
+        error_msg = f"Sorry, I encountered an error: {str(e)}"
+        session.add_ai_message(error_msg)
+
         return ChatResponse(
-            response=f"Sorry, I encountered an error: {str(e)}",
+            response=error_msg,
             tools_used=[],
+            session_id=session.session_id,
             success=False,
             error=str(e),
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# Session Management Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/sessions", response_model=SessionInfo)
+def create_session():
+    """Create a new conversation session."""
+    session = session_manager.create_session()
+    return session.get_summary()
+
+
+@app.get("/api/sessions", response_model=list[SessionInfo])
+def list_sessions():
+    """List all active conversation sessions."""
+    return session_manager.list_sessions()
+
+
+@app.get("/api/sessions/{session_id}", response_model=SessionInfo)
+def get_session(session_id: str):
+    """Get details of a specific session."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return session.get_summary()
+
+
+@app.get("/api/sessions/{session_id}/history")
+def get_session_history(session_id: str):
+    """Get the full conversation history for a session."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    history = []
+    for msg in session.messages:
+        history.append({
+            "role": "user" if msg.type == "human" else "assistant",
+            "content": msg.content,
+        })
+
+    return {
+        "session_id": session_id,
+        "messages": history,
+        "total_messages": len(history),
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    """Delete a conversation session."""
+    deleted = session_manager.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"message": f"Session {session_id} deleted"}
 
 
 # ── Health Check ──────────────────────────────────────────────────
@@ -151,10 +251,16 @@ def health_check():
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.5.0",
+        "version": "0.6.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
         "agent_ready": agent is not None,
-        "features": ["parallel_execution", "conditional_routing", "argument_extraction"],
+        "active_sessions": session_manager.active_count,
+        "features": [
+            "parallel_execution",
+            "conditional_routing",
+            "argument_extraction",
+            "conversation_memory",
+        ],
     }
 
 

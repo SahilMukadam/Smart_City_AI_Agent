@@ -1,13 +1,14 @@
 """
-Smart City AI Agent - LangGraph Agent (Day 5)
-Parallel tool execution + conditional routing + argument extraction.
+Smart City AI Agent - LangGraph Agent (Day 6)
+Parallel execution + conditional routing + argument extraction + conversation memory.
 
 Graph flow:
   START → router → [should_use_tools?]
-                      ├── yes → tool_executor (parallel) → analyzer → responder → END
+                      ├── yes → argument_extractor → tool_executor (parallel) → analyzer → responder → END
                       └── no  → direct_responder → END
 """
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────
 MAX_ITERATIONS = 3
-MAX_PARALLEL_WORKERS = 4  # Max concurrent API calls
+MAX_PARALLEL_WORKERS = 4
 
 SYSTEM_PROMPT = """You are the Smart City AI Agent, an expert analyst for London city conditions.
 You have access to real-time data tools for:
@@ -48,7 +49,7 @@ Guidelines:
 - Current date/time: {current_time}
 """
 
-ROUTER_PROMPT = """Based on the user's question, decide which tools to call.
+ROUTER_PROMPT = """Based on the user's question and conversation history, decide which tools to call.
 
 Available tools:
 - get_tube_status: London Underground line status and delays
@@ -62,21 +63,16 @@ Available tools:
 - get_traffic_incidents: Accidents, roadworks, jams from TomTom
 
 RULES:
-- If the user is just greeting you (hi, hello, hey) or asking a non-city question, respond with: NONE
+- If the user is just greeting you or asking a non-city question, respond with: NONE
 - Otherwise, return a comma-separated list of tool names. Choose the minimum set needed.
+- For follow-up questions, consider the CONVERSATION HISTORY to understand context.
+  Example: if user previously asked about traffic and now says "what about the weather?",
+  they want weather for the same area.
 - For broad questions ("how's London?"), use: get_tube_status,get_current_weather,get_london_traffic_overview
 
-Examples:
-- "Hi there" → NONE
-- "How's the tube?" → get_tube_status
-- "Why is traffic bad?" → get_traffic_flow,get_road_disruptions,get_current_weather
-- "What's it like outside?" → get_current_weather,get_air_quality
-- "London overview" → get_tube_status,get_current_weather,get_london_traffic_overview
-- "Will it rain?" → get_weather_forecast
-- "Compare traffic in Canary Wharf vs City" → get_traffic_flow,get_traffic_flow
-- "Air quality and traffic in Central London" → get_air_quality,get_traffic_flow
+{conversation_context}
 
-User question: {question}
+Current question: {question}
 
 Tools to call (comma-separated list, or NONE):"""
 
@@ -84,6 +80,8 @@ ARGUMENT_PROMPT = """You are deciding what arguments to pass to city data tools.
 
 User question: {question}
 Tools to call: {tools}
+
+{conversation_context}
 
 For each tool, decide what arguments to pass. Most tools default to Central London (51.5074, -0.1278) which is fine for general queries.
 
@@ -112,24 +110,17 @@ Known London locations:
 
 Respond ONLY with a JSON object. Keys are tool names, values are argument dicts.
 If a tool needs no arguments or defaults are fine, use empty dict {{}}.
-If the user asks about a specific area, provide coordinates.
+If the user asks about a specific area (or references one from conversation history), provide coordinates.
 If user asks to compare two locations with the same tool, use keys like "get_traffic_flow__1" and "get_traffic_flow__2".
-
-Example for "traffic near Tower Bridge":
-{{"get_traffic_flow": {{"latitude": 51.5055, "longitude": -0.0754, "location_name": "Tower Bridge"}}}}
-
-Example for "weather and tube status":
-{{"get_current_weather": {{}}, "get_tube_status": {{}}}}
-
-Example for "compare traffic Canary Wharf vs City":
-{{"get_traffic_flow__1": {{"latitude": 51.5054, "longitude": -0.0235, "location_name": "Canary Wharf"}}, "get_traffic_flow__2": {{"latitude": 51.5155, "longitude": -0.0922, "location_name": "City of London"}}}}
 
 User question: {question}
 JSON arguments:"""
 
 ANALYSIS_PROMPT = """You are analyzing real-time London city data to answer the user's question.
 
-User question: {question}
+{conversation_context}
+
+Current question: {question}
 
 Data collected from tools:
 {tool_data}
@@ -140,6 +131,7 @@ Provide a clear, insightful analysis that:
 3. Identifies any correlations between data sources (e.g., weather affecting traffic)
 4. Notes anything unusual or noteworthy
 5. Is concise — lead with the key insight, then supporting details
+6. If this is a follow-up question, reference relevant information from the conversation history
 
 If some data sources failed or returned no data, work with what's available and note the gap briefly."""
 
@@ -147,8 +139,11 @@ DIRECT_RESPONSE_PROMPT = """You are the Smart City AI Agent for London. The user
 that doesn't require any data tools (it might be a greeting, a general question,
 or something unrelated to city data).
 
+{conversation_context}
+
 Respond naturally. If they're greeting you, introduce yourself briefly and mention
 what you can help with (London traffic, weather, air quality, tube status).
+If there's conversation history, you can reference it.
 Keep it concise and friendly.
 
 User message: {question}"""
@@ -159,7 +154,6 @@ User message: {question}"""
 # ══════════════════════════════════════════════════════════════════
 
 def _get_llm() -> ChatGoogleGenerativeAI:
-    """Create a Gemini LLM instance."""
     settings = get_settings()
     return ChatGoogleGenerativeAI(
         model=settings.GEMINI_MODEL,
@@ -170,14 +164,48 @@ def _get_llm() -> ChatGoogleGenerativeAI:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Conversation Context Helper
+# ══════════════════════════════════════════════════════════════════
+
+def _build_conversation_context(messages: list) -> str:
+    """
+    Build a conversation context string from message history.
+    Only includes previous exchanges (not the current question).
+    Returns empty string if no history.
+    """
+    # Filter to only LangChain message objects (skip tuples from initial invoke)
+    history = []
+    for msg in messages:
+        if hasattr(msg, "type") and hasattr(msg, "content"):
+            if msg.type == "human":
+                history.append(f"User: {msg.content}")
+            elif msg.type == "ai":
+                # Truncate long AI responses for context
+                content = msg.content
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                history.append(f"Agent: {content}")
+
+    # Exclude the last user message (that's the current question)
+    if history and history[-1].startswith("User:"):
+        history = history[:-1]
+
+    if not history:
+        return ""
+
+    context = "CONVERSATION HISTORY (previous exchanges):\n"
+    context += "\n".join(history[-6:])  # Last 3 exchanges max
+    return context
+
+
+# ══════════════════════════════════════════════════════════════════
 # Graph Nodes
 # ══════════════════════════════════════════════════════════════════
 
 def router_node(state: CityAgentState) -> dict:
     """
-    NODE 1: Router
-    Reads the user's question, decides which tools to call.
-    Returns NONE for simple greetings/non-city queries.
+    NODE 1: Router — now context-aware.
+    Sees conversation history to understand follow-up questions.
     """
     logger.info("🔀 Router: Deciding which tools to call...")
 
@@ -185,17 +213,21 @@ def router_node(state: CityAgentState) -> dict:
     last_message = messages[-1]
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
 
+    conversation_context = _build_conversation_context(messages)
+
     try:
         llm = _get_llm()
-        prompt = ROUTER_PROMPT.format(question=question)
+        prompt = ROUTER_PROMPT.format(
+            question=question,
+            conversation_context=conversation_context,
+        )
         response = llm.invoke([HumanMessage(content=prompt)])
 
         raw = response.content.strip()
         raw = raw.replace("`", "").replace('"', "").replace("'", "")
 
-        # Check for NONE response (no tools needed)
         if raw.upper() == "NONE":
-            logger.info("🔀 Router: No tools needed (greeting/non-city query)")
+            logger.info("🔀 Router: No tools needed")
             return {
                 "tools_to_call": [],
                 "iteration_count": state.get("iteration_count", 0) + 1,
@@ -226,16 +258,14 @@ def router_node(state: CityAgentState) -> dict:
 
 def argument_extractor_node(state: CityAgentState) -> dict:
     """
-    NODE 2: Argument Extractor
-    Determines what arguments to pass to each tool based on the user's question.
-    E.g., if user asks about "Tower Bridge traffic", passes Tower Bridge coordinates.
+    NODE 2: Argument Extractor — now uses conversation context
+    to infer locations from follow-up questions.
     """
     tools_to_call = state.get("tools_to_call", [])
     messages = state["messages"]
     last_message = messages[-1]
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
 
-    # For simple single-tool queries with no location, skip LLM call
     no_arg_tools = {
         "get_tube_status", "get_road_disruptions",
         "get_london_traffic_overview", "get_traffic_incidents",
@@ -245,22 +275,23 @@ def argument_extractor_node(state: CityAgentState) -> dict:
         tool_args = {t: {} for t in tools_to_call}
         return {"tool_arguments": tool_args}
 
+    conversation_context = _build_conversation_context(messages)
+
     try:
         llm = _get_llm()
         prompt = ARGUMENT_PROMPT.format(
             question=question,
             tools=", ".join(tools_to_call),
+            conversation_context=conversation_context,
         )
         response = llm.invoke([HumanMessage(content=prompt)])
 
         raw = response.content.strip()
-        # Clean markdown code fences if present
         if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1]  # Remove first line
-            raw = raw.rsplit("```", 1)[0]  # Remove last fence
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0]
             raw = raw.strip()
 
-        import json
         tool_args = json.loads(raw)
         logger.info(f"🎯 Argument Extractor: {tool_args}")
 
@@ -275,20 +306,12 @@ def argument_extractor_node(state: CityAgentState) -> dict:
 def tool_executor_node(state: CityAgentState) -> dict:
     """
     NODE 3: Parallel Tool Executor
-    Calls all selected tools SIMULTANEOUSLY using ThreadPoolExecutor.
-    This is the key Day 5 upgrade — 3 API calls that took 3-4 seconds
-    sequentially now complete in ~1.5 seconds.
+    Calls all selected tools simultaneously.
     """
     tool_args = state.get("tool_arguments", {})
     tools_to_call = state.get("tools_to_call", [])
 
-    # Build the execution plan: merge tool_args with tools_to_call
-    execution_plan = {}
-    if tool_args:
-        # Use tool_arguments as the plan (may have __1, __2 suffixes)
-        execution_plan = tool_args
-    else:
-        execution_plan = {t: {} for t in tools_to_call}
+    execution_plan = tool_args if tool_args else {t: {} for t in tools_to_call}
 
     total = len(execution_plan)
     logger.info(f"🔧 Tool Executor: Calling {total} tools in parallel...")
@@ -296,8 +319,6 @@ def tool_executor_node(state: CityAgentState) -> dict:
     results: dict[str, str] = {}
 
     def _call_tool(tool_key: str, args: dict) -> tuple[str, str]:
-        """Call a single tool and return (key, result_string)."""
-        # Handle suffixed keys like "get_traffic_flow__1"
         base_name = tool_key.split("__")[0]
         tool_func = TOOL_MAP.get(base_name)
 
@@ -313,7 +334,6 @@ def tool_executor_node(state: CityAgentState) -> dict:
             logger.error(f"  ❌ {tool_key} failed: {e}")
             return tool_key, f"ERROR: {str(e)}"
 
-    # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
         futures = {
             executor.submit(_call_tool, tool_key, args): tool_key
@@ -333,9 +353,8 @@ def tool_executor_node(state: CityAgentState) -> dict:
 
 def analyzer_node(state: CityAgentState) -> dict:
     """
-    NODE 4: Analyzer
-    Takes all tool results, sends them to Gemini for correlation
-    and insight generation.
+    NODE 4: Analyzer — now sees conversation history for
+    context-aware analysis.
     """
     logger.info("🧠 Analyzer: Correlating data...")
 
@@ -344,8 +363,8 @@ def analyzer_node(state: CityAgentState) -> dict:
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
 
     tool_results = state.get("tool_results", {})
+    conversation_context = _build_conversation_context(messages)
 
-    # Format tool results for the LLM
     tool_data_parts = []
     for tool_name, result in tool_results.items():
         tool_data_parts.append(f"--- {tool_name} ---\n{result}")
@@ -358,6 +377,7 @@ def analyzer_node(state: CityAgentState) -> dict:
         analysis_prompt = ANALYSIS_PROMPT.format(
             question=question,
             tool_data=tool_data,
+            conversation_context=conversation_context,
         )
 
         response = llm.invoke([
@@ -381,10 +401,7 @@ def analyzer_node(state: CityAgentState) -> dict:
 
 
 def responder_node(state: CityAgentState) -> dict:
-    """
-    NODE 5: Responder
-    Formats the analysis as the final AI message with data sources.
-    """
+    """NODE 5: Responder — formats the final answer."""
     logger.info("💬 Responder: Formatting final answer...")
 
     analysis = state.get("analysis", "No analysis available.")
@@ -392,34 +409,31 @@ def responder_node(state: CityAgentState) -> dict:
 
     response_parts = [analysis]
 
-    # Add data sources footer
     successful_tools = [t for t, r in tool_results.items() if not r.startswith("ERROR")]
     if successful_tools:
         sources = ", ".join(successful_tools)
         response_parts.append(f"\n\n📊 *Data sources: {sources}*")
 
     final_response = "\n".join(response_parts)
-
-    return {
-        "messages": [AIMessage(content=final_response)],
-    }
+    return {"messages": [AIMessage(content=final_response)]}
 
 
 def direct_responder_node(state: CityAgentState) -> dict:
-    """
-    NODE (alternative): Direct Responder
-    Handles greetings and non-city queries WITHOUT calling any tools.
-    Saves 1 Gemini API call (no analyzer needed).
-    """
+    """NODE (alt): Direct response for non-tool queries."""
     logger.info("💬 Direct Responder: Handling non-tool query...")
 
     messages = state["messages"]
     last_message = messages[-1]
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
 
+    conversation_context = _build_conversation_context(messages)
+
     try:
         llm = _get_llm()
-        prompt = DIRECT_RESPONSE_PROMPT.format(question=question)
+        prompt = DIRECT_RESPONSE_PROMPT.format(
+            question=question,
+            conversation_context=conversation_context,
+        )
         response = llm.invoke([HumanMessage(content=prompt)])
         text = response.content.strip()
 
@@ -431,21 +445,14 @@ def direct_responder_node(state: CityAgentState) -> dict:
             "weather, and air quality. What would you like to know?"
         )
 
-    return {
-        "messages": [AIMessage(content=text)],
-    }
+    return {"messages": [AIMessage(content=text)]}
 
 
 # ══════════════════════════════════════════════════════════════════
-# Conditional Edge: Should We Use Tools?
+# Conditional Edge
 # ══════════════════════════════════════════════════════════════════
 
 def should_use_tools(state: CityAgentState) -> str:
-    """
-    Conditional edge after router.
-    If router selected tools → go to argument_extractor → tool_executor
-    If router returned empty → go to direct_responder (skip tools entirely)
-    """
     tools = state.get("tools_to_call", [])
     if tools:
         return "argument_extractor"
@@ -458,17 +465,15 @@ def should_use_tools(state: CityAgentState) -> str:
 
 def build_agent_graph() -> StateGraph:
     """
-    Build and compile the LangGraph agent with parallel execution
-    and conditional routing.
+    Build and compile the LangGraph agent.
 
     Flow:
       START → router → [should_use_tools?]
-                          ├── yes → argument_extractor → tool_executor (parallel) → analyzer → responder → END
+                          ├── yes → argument_extractor → tool_executor → analyzer → responder → END
                           └── no  → direct_responder → END
     """
     graph = StateGraph(CityAgentState)
 
-    # Add nodes
     graph.add_node("router", router_node)
     graph.add_node("argument_extractor", argument_extractor_node)
     graph.add_node("tool_executor", tool_executor_node)
@@ -476,10 +481,7 @@ def build_agent_graph() -> StateGraph:
     graph.add_node("responder", responder_node)
     graph.add_node("direct_responder", direct_responder_node)
 
-    # Entry point
     graph.add_edge(START, "router")
-
-    # Conditional: does the query need tools?
     graph.add_conditional_edges(
         "router",
         should_use_tools,
@@ -488,24 +490,17 @@ def build_agent_graph() -> StateGraph:
             "direct_responder": "direct_responder",
         },
     )
-
-    # Tool path: extract args → execute → analyze → respond
     graph.add_edge("argument_extractor", "tool_executor")
     graph.add_edge("tool_executor", "analyzer")
     graph.add_edge("analyzer", "responder")
     graph.add_edge("responder", END)
-
-    # Direct path: respond without tools
     graph.add_edge("direct_responder", END)
 
-    # Compile
     agent = graph.compile()
-    logger.info("✅ Agent graph compiled (parallel execution + conditional routing)")
+    logger.info("✅ Agent graph compiled (parallel + conditional + memory-aware)")
 
     return agent
 
-
-# ── Convenience function ──────────────────────────────────────────
 
 def create_agent():
     """Create and return a ready-to-use agent instance."""

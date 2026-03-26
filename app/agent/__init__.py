@@ -5,5 +5,12 @@ LangGraph-based autonomous agent for London city data analysis.
 
 from app.agent.graph import create_agent, build_agent_graph
 from app.agent.state import CityAgentState
+from app.agent.sessions import Session, SessionManager
 
-__all__ = ["create_agent", "build_agent_graph", "CityAgentState"]
+__all__ = [
+    "create_agent",
+    "build_agent_graph",
+    "CityAgentState",
+    "Session",
+    "SessionManager",
+]

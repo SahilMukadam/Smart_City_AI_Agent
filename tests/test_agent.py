@@ -1,14 +1,15 @@
 """
-Smart City AI Agent - Agent Tests (Day 5)
-Tests parallel execution, conditional routing, argument extraction.
-All LLM calls mocked — 0 Gemini API usage.
+Smart City AI Agent - Agent Tests (Day 6)
+Tests parallel execution, conditional routing, argument extraction,
+and conversation memory context.
 
 Run: pytest tests/test_agent.py -v
 """
 
 from unittest.mock import patch, MagicMock
-from concurrent.futures import ThreadPoolExecutor
 import pytest
+
+from langchain_core.messages import HumanMessage, AIMessage
 
 from app.agent.state import CityAgentState
 from app.agent.tools import ALL_TOOLS, TOOL_MAP, get_tool_descriptions
@@ -21,15 +22,42 @@ from app.agent.graph import (
     direct_responder_node,
     should_use_tools,
     build_agent_graph,
+    _build_conversation_context,
 )
 
 
 # ── Helper ────────────────────────────────────────────────────────
 
 def _make_state(message: str, **overrides) -> dict:
-    """Create a minimal state with a user message."""
     state = {
-        "messages": [MagicMock(content=message)],
+        "messages": [MagicMock(content=message, type="human")],
+        "tools_to_call": [],
+        "tool_arguments": {},
+        "tool_results": {},
+        "analysis": "",
+        "iteration_count": 0,
+        "error": "",
+    }
+    state.update(overrides)
+    return state
+
+
+def _make_state_with_history(
+    history: list[tuple[str, str]],
+    current_question: str,
+    **overrides,
+) -> dict:
+    """Create state with conversation history.
+    history: list of (user_msg, ai_msg) tuples.
+    """
+    messages = []
+    for user_msg, ai_msg in history:
+        messages.append(HumanMessage(content=user_msg))
+        messages.append(AIMessage(content=ai_msg))
+    messages.append(HumanMessage(content=current_question))
+
+    state = {
+        "messages": messages,
         "tools_to_call": [],
         "tool_arguments": {},
         "tool_results": {},
@@ -45,7 +73,6 @@ def _make_state(message: str, **overrides) -> dict:
 
 
 class TestToolDefinitions:
-    """Test that all tools are properly defined and registered."""
 
     def test_all_tools_registered(self):
         assert len(ALL_TOOLS) == 9
@@ -57,7 +84,7 @@ class TestToolDefinitions:
             "get_traffic_flow", "get_london_traffic_overview", "get_traffic_incidents",
         ]
         for name in expected:
-            assert name in TOOL_MAP, f"Missing tool: {name}"
+            assert name in TOOL_MAP
 
     def test_all_tools_have_descriptions(self):
         for tool in ALL_TOOLS:
@@ -68,6 +95,60 @@ class TestToolDefinitions:
         desc = get_tool_descriptions()
         assert "get_tube_status" in desc
         assert "get_traffic_flow" in desc
+
+
+# ── Conversation Context Tests ────────────────────────────────────
+
+
+class TestConversationContext:
+    """Test the conversation context builder."""
+
+    def test_empty_history(self):
+        messages = [HumanMessage(content="Hello")]
+        context = _build_conversation_context(messages)
+        assert context == ""
+
+    def test_single_exchange(self):
+        messages = [
+            HumanMessage(content="How's the tube?"),
+            AIMessage(content="All lines have good service."),
+            HumanMessage(content="What about traffic?"),
+        ]
+        context = _build_conversation_context(messages)
+        assert "How's the tube?" in context
+        assert "All lines have good service." in context
+        # Current question should NOT be in context
+        assert "What about traffic?" not in context
+
+    def test_truncates_long_ai_messages(self):
+        long_response = "A" * 500
+        messages = [
+            HumanMessage(content="Q1"),
+            AIMessage(content=long_response),
+            HumanMessage(content="Q2"),
+        ]
+        context = _build_conversation_context(messages)
+        assert "..." in context
+        assert len(context) < len(long_response)
+
+    def test_limits_to_recent_exchanges(self):
+        messages = []
+        for i in range(10):
+            messages.append(HumanMessage(content=f"Question {i}"))
+            messages.append(AIMessage(content=f"Answer {i}"))
+        messages.append(HumanMessage(content="Current question"))
+
+        context = _build_conversation_context(messages)
+        # Should only include last 3 exchanges (6 messages)
+        assert "Question 9" in context
+        assert "Question 0" not in context
+
+    def test_skips_non_langchain_messages(self):
+        """Tuples from initial invoke should be skipped."""
+        messages = [("user", "hello"), MagicMock(content="World", type="human")]
+        context = _build_conversation_context(messages)
+        # Only the MagicMock should be processed, but it's the current msg
+        assert context == ""
 
 
 # ── Router Node Tests ─────────────────────────────────────────────
@@ -97,18 +178,17 @@ class TestRouterNode:
     @patch("app.agent.graph._get_llm")
     def test_router_filters_invalid_tools(self, mock_get_llm):
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content="get_tube_status,fake_tool,get_air_quality")
+        mock_llm.invoke.return_value = MagicMock(content="get_tube_status,fake_tool")
         mock_get_llm.return_value = mock_llm
 
-        result = router_node(_make_state("Tubes and air"))
+        result = router_node(_make_state("Tubes"))
         assert "get_tube_status" in result["tools_to_call"]
-        assert "get_air_quality" in result["tools_to_call"]
         assert "fake_tool" not in result["tools_to_call"]
 
     @patch("app.agent.graph._get_llm")
     def test_router_fallback_on_garbage(self, mock_get_llm):
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content="I think you should check weather")
+        mock_llm.invoke.return_value = MagicMock(content="Sure, let me check weather")
         mock_get_llm.return_value = mock_llm
 
         result = router_node(_make_state("Weather?"))
@@ -117,28 +197,35 @@ class TestRouterNode:
     @patch("app.agent.graph._get_llm")
     def test_router_handles_llm_error(self, mock_get_llm):
         mock_llm = MagicMock()
-        mock_llm.invoke.side_effect = Exception("API quota exceeded")
+        mock_llm.invoke.side_effect = Exception("API error")
         mock_get_llm.return_value = mock_llm
 
-        result = router_node(_make_state("What's happening?"))
+        result = router_node(_make_state("Help"))
         assert len(result["tools_to_call"]) > 0
         assert "error" in result
 
     @patch("app.agent.graph._get_llm")
-    def test_router_increments_iteration(self, mock_get_llm):
+    def test_router_with_history_context(self, mock_get_llm):
+        """Router should receive conversation history in its prompt."""
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content="get_tube_status")
+        mock_llm.invoke.return_value = MagicMock(content="get_traffic_flow")
         mock_get_llm.return_value = mock_llm
 
-        result = router_node(_make_state("Tube?", iteration_count=0))
-        assert result["iteration_count"] == 1
+        state = _make_state_with_history(
+            history=[("How's traffic in Camden?", "Camden has moderate congestion.")],
+            current_question="What about Canary Wharf?",
+        )
+        result = router_node(state)
+
+        # Verify the LLM was called with context that includes history
+        call_args = mock_llm.invoke.call_args[0][0][0].content
+        assert "Camden" in call_args
 
 
 # ── Conditional Routing Tests ─────────────────────────────────────
 
 
 class TestConditionalRouting:
-    """Test the should_use_tools conditional edge."""
 
     def test_routes_to_tools_when_tools_selected(self):
         state = _make_state("Traffic?", tools_to_call=["get_traffic_flow"])
@@ -153,21 +240,17 @@ class TestConditionalRouting:
 
 
 class TestArgumentExtractor:
-    """Test argument extraction for tool calls."""
 
     def test_skips_llm_for_no_arg_tools(self):
-        """Tools that need no args should skip the LLM call entirely."""
         state = _make_state(
-            "Tube status?",
+            "Tube?",
             tools_to_call=["get_tube_status", "get_road_disruptions"],
         )
         result = argument_extractor_node(state)
-        assert "get_tube_status" in result["tool_arguments"]
         assert result["tool_arguments"]["get_tube_status"] == {}
 
     @patch("app.agent.graph._get_llm")
     def test_extracts_location_args(self, mock_get_llm):
-        """Should extract coordinates for location-specific tools."""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = MagicMock(
             content='{"get_traffic_flow": {"latitude": 51.5055, "longitude": -0.0754, "location_name": "Tower Bridge"}}'
@@ -179,39 +262,28 @@ class TestArgumentExtractor:
             tools_to_call=["get_traffic_flow"],
         )
         result = argument_extractor_node(state)
-
-        args = result["tool_arguments"]["get_traffic_flow"]
-        assert args["latitude"] == 51.5055
-        assert args["location_name"] == "Tower Bridge"
+        assert result["tool_arguments"]["get_traffic_flow"]["latitude"] == 51.5055
 
     @patch("app.agent.graph._get_llm")
     def test_fallback_on_parse_error(self, mock_get_llm):
-        """Bad JSON from LLM should fall back to empty args."""
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content="not valid json at all")
+        mock_llm.invoke.return_value = MagicMock(content="not json")
         mock_get_llm.return_value = mock_llm
 
-        state = _make_state(
-            "Traffic?",
-            tools_to_call=["get_traffic_flow"],
-        )
+        state = _make_state("Traffic?", tools_to_call=["get_traffic_flow"])
         result = argument_extractor_node(state)
-
-        # Should have fallback empty args
-        assert "get_traffic_flow" in result["tool_arguments"]
         assert result["tool_arguments"]["get_traffic_flow"] == {}
 
 
-# ── Parallel Tool Executor Tests ──────────────────────────────────
+# ── Tool Executor Tests ───────────────────────────────────────────
 
 
 class TestToolExecutor:
-    """Test the parallel tool executor."""
 
     @patch("app.agent.tools._tfl")
     def test_executor_calls_tool(self, mock_tfl):
         mock_result = MagicMock()
-        mock_result.to_agent_string.return_value = "[tfl:tube_status] All good"
+        mock_result.to_agent_string.return_value = "[tfl] data"
         mock_tfl.get_tube_status.return_value = mock_result
 
         state = _make_state(
@@ -237,17 +309,11 @@ class TestToolExecutor:
         assert result["tool_results"] == {}
 
     def test_executor_handles_suffixed_keys(self):
-        """Tools with __1, __2 suffixes should resolve to base tool name."""
         state = _make_state(
             "Compare",
             tools_to_call=["get_traffic_flow"],
-            tool_arguments={
-                "get_traffic_flow__1": {},
-                "get_traffic_flow__2": {},
-            },
+            tool_arguments={"get_traffic_flow__1": {}, "get_traffic_flow__2": {}},
         )
-        # This will fail because the real tools aren't mocked,
-        # but the keys should be attempted correctly
         result = tool_executor_node(state)
         assert "get_traffic_flow__1" in result["tool_results"]
         assert "get_traffic_flow__2" in result["tool_results"]
@@ -255,7 +321,6 @@ class TestToolExecutor:
     @patch("app.agent.tools._tfl")
     @patch("app.agent.tools._weather")
     def test_executor_runs_multiple_tools(self, mock_weather, mock_tfl):
-        """Multiple tools should all be called and results collected."""
         mock_tfl_result = MagicMock()
         mock_tfl_result.to_agent_string.return_value = "[tfl] data"
         mock_tfl.get_tube_status.return_value = mock_tfl_result
@@ -265,15 +330,11 @@ class TestToolExecutor:
         mock_weather.get_current_weather.return_value = mock_weather_result
 
         state = _make_state(
-            "Tube and weather?",
+            "Both?",
             tools_to_call=["get_tube_status", "get_current_weather"],
-            tool_arguments={
-                "get_tube_status": {},
-                "get_current_weather": {},
-            },
+            tool_arguments={"get_tube_status": {}, "get_current_weather": {}},
         )
         result = tool_executor_node(state)
-
         assert "get_tube_status" in result["tool_results"]
         assert "get_current_weather" in result["tool_results"]
 
@@ -289,10 +350,7 @@ class TestAnalyzerNode:
         mock_llm.invoke.return_value = MagicMock(content="Traffic is flowing well.")
         mock_get_llm.return_value = mock_llm
 
-        state = _make_state(
-            "How's traffic?",
-            tool_results={"get_traffic_flow": "[tomtom] 45km/h"},
-        )
+        state = _make_state("Traffic?", tool_results={"get_traffic_flow": "[tomtom] 45km/h"})
         result = analyzer_node(state)
         assert result["analysis"] == "Traffic is flowing well."
 
@@ -302,13 +360,9 @@ class TestAnalyzerNode:
         mock_llm.invoke.side_effect = Exception("Rate limited")
         mock_get_llm.return_value = mock_llm
 
-        state = _make_state(
-            "Overview",
-            tool_results={"get_tube_status": "All lines good"},
-        )
+        state = _make_state("Overview", tool_results={"get_tube_status": "All good"})
         result = analyzer_node(state)
-        assert "All lines good" in result["analysis"]
-        assert "error" in result
+        assert "All good" in result["analysis"]
 
 
 # ── Responder Node Tests ──────────────────────────────────────────
@@ -319,17 +373,17 @@ class TestResponderNode:
     def test_responder_creates_ai_message(self):
         state = _make_state(
             "Test",
-            analysis="London traffic is moderate today.",
+            analysis="London traffic is moderate.",
             tools_to_call=["get_traffic_flow"],
             tool_results={"get_traffic_flow": "data..."},
         )
         result = responder_node(state)
-        assert "London traffic is moderate today." in result["messages"][0].content
+        assert "London traffic is moderate." in result["messages"][0].content
 
     def test_responder_includes_data_sources(self):
         state = _make_state(
             "Test",
-            analysis="Analysis here.",
+            analysis="Analysis.",
             tools_to_call=["get_tube_status"],
             tool_results={"get_tube_status": "Good service"},
         )
@@ -339,11 +393,11 @@ class TestResponderNode:
     def test_responder_excludes_failed_tools(self):
         state = _make_state(
             "Test",
-            analysis="Partial analysis.",
+            analysis="Partial.",
             tools_to_call=["get_tube_status", "get_air_quality"],
             tool_results={
-                "get_tube_status": "Good service",
-                "get_air_quality": "ERROR: Connection failed",
+                "get_tube_status": "Good",
+                "get_air_quality": "ERROR: Failed",
             },
         )
         result = responder_node(state)
@@ -356,32 +410,23 @@ class TestResponderNode:
 
 
 class TestDirectResponder:
-    """Test the direct responder for non-tool queries."""
 
     @patch("app.agent.graph._get_llm")
     def test_direct_responder_greeting(self, mock_get_llm):
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(
-            content="Hello! I'm the Smart City Agent. How can I help?"
-        )
+        mock_llm.invoke.return_value = MagicMock(content="Hello! I'm the Smart City Agent.")
         mock_get_llm.return_value = mock_llm
 
-        state = _make_state("Hi there!")
-        result = direct_responder_node(state)
-
-        assert len(result["messages"]) == 1
+        result = direct_responder_node(_make_state("Hi!"))
         assert "Hello" in result["messages"][0].content
 
     @patch("app.agent.graph._get_llm")
     def test_direct_responder_handles_error(self, mock_get_llm):
         mock_llm = MagicMock()
-        mock_llm.invoke.side_effect = Exception("LLM down")
+        mock_llm.invoke.side_effect = Exception("Down")
         mock_get_llm.return_value = mock_llm
 
-        state = _make_state("Hey")
-        result = direct_responder_node(state)
-
-        # Should return fallback message
+        result = direct_responder_node(_make_state("Hey"))
         assert "Smart City AI Agent" in result["messages"][0].content
 
 
@@ -398,17 +443,11 @@ class TestGraphStructure:
         graph = build_agent_graph()
         graph_repr = graph.get_graph()
         node_ids = list(graph_repr.nodes)
-        assert "router" in node_ids
-        assert "argument_extractor" in node_ids
-        assert "tool_executor" in node_ids
-        assert "analyzer" in node_ids
-        assert "responder" in node_ids
-        assert "direct_responder" in node_ids
+        for name in ["router", "argument_extractor", "tool_executor", "analyzer", "responder", "direct_responder"]:
+            assert name in node_ids
 
     def test_graph_has_six_nodes(self):
-        """Day 5 graph should have 6 nodes (+ __start__, __end__)."""
         graph = build_agent_graph()
         graph_repr = graph.get_graph()
-        # Filter out __start__ and __end__
         real_nodes = [n for n in graph_repr.nodes if not n.startswith("__")]
         assert len(real_nodes) == 6

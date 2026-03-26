@@ -7,3 +7,4 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 # to add changes at the end:
 1. the location should be selected based on the coordinates. the bbox should be able to be configured the the config or the .env file.
    I dont want there to be many places where i change the lat and lon 
+2. since this project is about london the config of lat and lon should be in one place...

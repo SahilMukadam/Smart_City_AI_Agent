@@ -1,10 +1,10 @@
 """
-Smart City AI Agent - Day 5 Live Test Script
-Tests parallel execution + conditional routing with real Gemini calls.
+Smart City AI Agent - Day 6 Live Test: Conversation Memory
+Tests multi-turn conversations where the agent remembers context.
 
 Usage: python -m scripts.test_agent_live
 
-⚠️ Uses ~5-6 Gemini API calls total.
+⚠️ Uses ~8-10 Gemini API calls total.
 """
 
 import logging
@@ -20,17 +20,19 @@ logging.basicConfig(
 )
 
 from app.agent.graph import create_agent
+from app.agent.sessions import SessionManager
 
 
-def test_query(agent, question: str, expect_tools: bool = True):
-    """Run a single query and show timing."""
-    print(f"\n{'='*70}")
-    print(f"📨 Question: {question}")
-    print(f"{'='*70}")
+def chat(session_manager, agent, session_id, question):
+    """Simulate the /api/agent/chat flow."""
+    session = session_manager.get_or_create_session(session_id)
+    session.add_user_message(question)
+
+    print(f"\n  👤 You: {question}")
 
     start = time.perf_counter()
     result = agent.invoke({
-        "messages": [("user", question)],
+        "messages": session.get_recent_messages(max_messages=10),
         "tools_to_call": [],
         "tool_arguments": {},
         "tool_results": {},
@@ -40,68 +42,61 @@ def test_query(agent, question: str, expect_tools: bool = True):
     })
     elapsed = time.perf_counter() - start
 
-    # Tools selected
-    tools = result.get("tools_to_call", [])
-    print(f"\n🔧 Tools selected: {', '.join(tools) if tools else 'NONE (direct response)'}")
-
-    # Tool arguments
-    tool_args = result.get("tool_arguments", {})
-    if tool_args:
-        for tool_name, args in tool_args.items():
-            if args:
-                print(f"  🎯 {tool_name}: {args}")
-
-    # Tool results (truncated)
-    for tool_name, tool_result in result.get("tool_results", {}).items():
-        truncated = tool_result[:120] + "..." if len(tool_result) > 120 else tool_result
-        status = "✅" if not tool_result.startswith("ERROR") else "❌"
-        print(f"  {status} {tool_name}: {truncated}")
-
-    # Final response
+    # Extract response
     messages = result.get("messages", [])
     ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
-    if ai_messages:
-        print(f"\n💬 Response:\n{ai_messages[-1].content}")
+    response_text = ai_messages[-1].content if ai_messages else result.get("analysis", "No response")
 
-    print(f"\n⏱️ Total time: {elapsed:.2f}s")
+    tools = result.get("tools_to_call", [])
+    session.add_ai_message(response_text)
+    session.add_tools_used(tools)
 
-    if result.get("error"):
-        print(f"⚠️ Error: {result['error']}")
+    print(f"  🔧 Tools: {', '.join(tools) if tools else 'NONE'}")
+    # Show first 300 chars of response
+    display = response_text[:300] + "..." if len(response_text) > 300 else response_text
+    print(f"  🤖 Agent: {display}")
+    print(f"  ⏱️ {elapsed:.1f}s")
 
-    return elapsed
+    return session.session_id
 
 
 def main():
-    print("🏙️ Smart City AI Agent — Day 5 Live Test")
-    print("Features: Parallel execution + Conditional routing + Argument extraction\n")
+    print("🏙️ Smart City AI Agent — Day 6: Conversation Memory Test")
+    print("=" * 70)
 
     agent = create_agent()
-    print("✅ Agent created\n")
+    sm = SessionManager()
+    print("✅ Agent + Session Manager ready\n")
 
-    # Test 1: Direct response (no tools, ~1 Gemini call)
-    print("\n" + "─"*70)
-    print("TEST 1: Greeting (should skip tools entirely)")
-    print("─"*70)
-    t1 = test_query(agent, "Hello! What can you help me with?", expect_tools=False)
+    # ── Test 1: Multi-turn conversation ───────────────────────────
+    print("─" * 70)
+    print("TEST 1: Multi-turn conversation (3 turns, same session)")
+    print("The agent should remember previous context for follow-ups.")
+    print("─" * 70)
 
-    # Test 2: Multi-tool query (parallel execution, ~3 Gemini calls)
-    print("\n" + "─"*70)
-    print("TEST 2: Multi-source query (should call tools in parallel)")
-    print("─"*70)
-    t2 = test_query(agent, "What's the traffic, weather, and tube status in London right now?")
+    sid = None
+    sid = chat(sm, agent, sid, "How's the traffic in Central London right now?")
+    sid = chat(sm, agent, sid, "What about the weather there?")
+    sid = chat(sm, agent, sid, "Is the air quality good?")
 
-    # Test 3: Location-specific query (tests argument extraction, ~3 Gemini calls)
-    print("\n" + "─"*70)
-    print("TEST 3: Location-specific query (should extract coordinates)")
-    print("─"*70)
-    t3 = test_query(agent, "How's the traffic near Canary Wharf?")
+    # Show session stats
+    session = sm.get_session(sid)
+    print(f"\n  📝 Session {sid}: {session.metadata['total_queries']} queries, "
+          f"tools used: {session.metadata['tools_used']}")
 
-    print(f"\n{'='*70}")
-    print(f"✅ All tests complete!")
-    print(f"⏱️ Timing: Greeting={t1:.1f}s, Multi-tool={t2:.1f}s, Location={t3:.1f}s")
-    print(f"💡 Multi-tool should be fast due to parallel API calls")
-    print(f"📊 Total Gemini calls used: ~5-6 out of 250/day")
-    print(f"{'='*70}")
+    # ── Test 2: New session (no context) ──────────────────────────
+    print("\n" + "─" * 70)
+    print("TEST 2: Fresh session (no history)")
+    print("─" * 70)
+
+    chat(sm, agent, None, "Hi! What can you do?")
+
+    # ── Summary ───────────────────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"✅ Tests complete!")
+    print(f"📊 Active sessions: {sm.active_count}")
+    print(f"📊 Total Gemini calls used: ~8-10 out of 250/day")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
