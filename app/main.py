@@ -1,6 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 6: Full agent with conversation memory + session management.
+Day 7: Full agent with correlation engine.
 """
 
 import logging
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 
     if settings.GEMINI_API_KEY:
         agent = create_agent()
-        logger.info("✅ LangGraph agent initialized (parallel + conditional + memory)")
+        logger.info("✅ LangGraph agent initialized (parallel + conditional + memory + correlation)")
     else:
         logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
 
@@ -52,7 +52,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -146,6 +146,7 @@ def agent_chat(request: ChatRequest):
             "tools_to_call": [],
             "tool_arguments": {},
             "tool_results": {},
+            "correlation_insights": "",
             "analysis": "",
             "iteration_count": 0,
             "error": "",
@@ -251,7 +252,7 @@ def health_check():
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.6.0",
+        "version": "0.7.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
         "agent_ready": agent is not None,
         "active_sessions": session_manager.active_count,
@@ -260,6 +261,7 @@ def health_check():
             "conditional_routing",
             "argument_extraction",
             "conversation_memory",
+            "correlation_engine",
         ],
     }
 
