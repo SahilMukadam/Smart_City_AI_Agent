@@ -1,8 +1,9 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 7: Full agent with correlation engine.
+Day 8: Structured responses + caching + error handling.
 """
 
+import time
 import logging
 from contextlib import asynccontextmanager
 
@@ -15,8 +16,9 @@ from app.tools.tfl import TfLTool
 from app.tools.weather import WeatherTool
 from app.tools.air_quality import AirQualityTool
 from app.tools.tomtom import TomTomTool
-from app.agent.graph import create_agent
+from app.agent.graph import create_agent, get_cache
 from app.agent.sessions import SessionManager
+from app.agent.response_models import AgentResponse, SourceInfo, CorrelationInsight
 
 # ── Logging Setup ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,7 +40,7 @@ async def lifespan(app: FastAPI):
 
     if settings.GEMINI_API_KEY:
         agent = create_agent()
-        logger.info("✅ LangGraph agent initialized (parallel + conditional + memory + correlation)")
+        logger.info("✅ Agent initialized (parallel + caching + correlation)")
     else:
         logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
 
@@ -46,13 +48,12 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down.")
 
 
-# ── App Instance ──────────────────────────────────────────────────
 settings = get_settings()
 
 app = FastAPI(
     title=settings.APP_NAME,
     description="An autonomous AI agent for London city data analysis",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -71,74 +72,35 @@ air_quality_tool = AirQualityTool()
 tomtom_tool = TomTomTool()
 
 
-# ── Request/Response Models ───────────────────────────────────────
+# ── Request Model ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str = Field(
-        description="User's question about London city conditions",
-        min_length=1,
-        max_length=1000,
-    )
-    session_id: str | None = Field(
-        default=None,
-        description="Session ID for conversation continuity. "
-        "Omit to start a new session.",
-    )
-
-
-class ChatResponse(BaseModel):
-    response: str = Field(description="Agent's analysis and answer")
-    tools_used: list[str] = Field(description="Tools the agent called")
-    session_id: str = Field(description="Session ID for follow-up queries")
-    success: bool = Field(description="Whether the agent completed successfully")
-    error: str | None = Field(default=None, description="Error message if failed")
-
-
-class SessionInfo(BaseModel):
-    session_id: str
-    created_at: str
-    total_messages: int
-    total_queries: int
-    tools_used: list[str]
-    is_expired: bool
+    message: str = Field(min_length=1, max_length=1000)
+    session_id: str | None = Field(default=None)
 
 
 # ══════════════════════════════════════════════════════════════════
-# Agent Chat Endpoint (with session memory)
+# Agent Chat Endpoint (structured response)
 # ══════════════════════════════════════════════════════════════════
 
-@app.post("/api/agent/chat", response_model=ChatResponse)
+@app.post("/api/agent/chat", response_model=AgentResponse)
 def agent_chat(request: ChatRequest):
     """
     Send a question to the Smart City AI Agent.
-
-    Include a `session_id` from a previous response to continue a conversation.
-    The agent will remember previous questions and use them as context for
-    follow-up queries.
-
-    Omit `session_id` to start a fresh conversation.
+    Returns structured response with analysis, source metadata,
+    correlation insights, timing, and cache stats.
     """
     if agent is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Agent not available. Set GEMINI_API_KEY in .env",
-        )
+        raise HTTPException(status_code=503, detail="Agent not available. Set GEMINI_API_KEY in .env")
 
+    request_start = time.perf_counter()
     logger.info(f"📨 Agent chat: {request.message[:100]}...")
 
     # Get or create session
     session = session_manager.get_or_create_session(request.session_id)
-    logger.info(
-        f"📝 Session: {session.session_id} "
-        f"(history: {len(session.messages)} messages)"
-    )
-
-    # Add user message to session history
     session.add_user_message(request.message)
 
     try:
-        # Build message history for the agent
-        # Include previous conversation messages for context
         history_messages = session.get_recent_messages(max_messages=10)
 
         result = agent.invoke({
@@ -146,70 +108,103 @@ def agent_chat(request: ChatRequest):
             "tools_to_call": [],
             "tool_arguments": {},
             "tool_results": {},
+            "source_metadata": [],
             "correlation_insights": "",
+            "parsed_insights": [],
             "analysis": "",
             "iteration_count": 0,
             "error": "",
         })
 
-        # Extract the final AI message
+        # Extract response text
         messages = result.get("messages", [])
         ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
+        response_text = ai_messages[-1].content if ai_messages else result.get("analysis", "No response generated.")
 
-        if ai_messages:
-            response_text = ai_messages[-1].content
-        else:
-            response_text = result.get("analysis", "No response generated.")
+        # Build source info
+        sources = [
+            SourceInfo(
+                tool_name=m.get("tool_name", "unknown"),
+                success=m.get("success", False),
+                cached=m.get("cached", False),
+                response_time_ms=m.get("response_time_ms", 0),
+                error=m.get("error"),
+            )
+            for m in result.get("source_metadata", [])
+        ]
+
+        # Build correlation insights
+        insights = [
+            CorrelationInsight(
+                type=i.get("type", ""),
+                title=i.get("title", ""),
+                description=i.get("description", ""),
+                confidence=i.get("confidence", "medium"),
+            )
+            for i in result.get("parsed_insights", [])
+        ]
 
         tools_used = result.get("tools_to_call", [])
         error = result.get("error", "")
+        total_time = (time.perf_counter() - request_start) * 1000
 
-        # Store AI response and tools in session
+        # Store in session
         session.add_ai_message(response_text)
         session.add_tools_used(tools_used)
 
-        return ChatResponse(
+        # Cache stats for this request
+        cache = get_cache()
+        cache_hits = sum(1 for s in sources if s.cached)
+        cache_misses = sum(1 for s in sources if not s.cached and s.success)
+
+        return AgentResponse(
             response=response_text,
-            tools_used=tools_used,
-            session_id=session.session_id,
             success=True,
+            session_id=session.session_id,
+            tools_used=tools_used,
+            sources=sources,
+            insights=insights,
+            total_time_ms=round(total_time, 1),
             error=error if error else None,
+            cache_stats={
+                "hits_this_request": cache_hits,
+                "misses_this_request": cache_misses,
+                "global": cache.get_stats(),
+            },
         )
 
     except Exception as e:
         logger.error(f"Agent error: {e}")
+        total_time = (time.perf_counter() - request_start) * 1000
         error_msg = f"Sorry, I encountered an error: {str(e)}"
         session.add_ai_message(error_msg)
 
-        return ChatResponse(
+        return AgentResponse(
             response=error_msg,
-            tools_used=[],
-            session_id=session.session_id,
             success=False,
+            session_id=session.session_id,
+            total_time_ms=round(total_time, 1),
             error=str(e),
         )
 
 
 # ══════════════════════════════════════════════════════════════════
-# Session Management Endpoints
+# Session Endpoints
 # ══════════════════════════════════════════════════════════════════
 
-@app.post("/api/sessions", response_model=SessionInfo)
+@app.post("/api/sessions")
 def create_session():
-    """Create a new conversation session."""
     session = session_manager.create_session()
     return session.get_summary()
 
 
-@app.get("/api/sessions", response_model=list[SessionInfo])
+@app.get("/api/sessions")
 def list_sessions():
-    """List all active conversation sessions."""
     return session_manager.list_sessions()
 
 
-@app.get("/api/sessions/{session_id}", response_model=SessionInfo)
+@app.get("/api/sessions/{session_id}")
 def get_session(session_id: str):
-    """Get details of a specific session."""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -218,81 +213,83 @@ def get_session(session_id: str):
 
 @app.get("/api/sessions/{session_id}/history")
 def get_session_history(session_id: str):
-    """Get the full conversation history for a session."""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
-
-    history = []
-    for msg in session.messages:
-        history.append({
-            "role": "user" if msg.type == "human" else "assistant",
-            "content": msg.content,
-        })
-
     return {
         "session_id": session_id,
-        "messages": history,
-        "total_messages": len(history),
+        "messages": [
+            {"role": "user" if m.type == "human" else "assistant", "content": m.content}
+            for m in session.messages
+        ],
     }
 
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
-    """Delete a conversation session."""
-    deleted = session_manager.delete_session(session_id)
-    if not deleted:
+    if not session_manager.delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": f"Session {session_id} deleted"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# Cache Management Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/cache/stats")
+def get_cache_stats():
+    """Get cache performance statistics."""
+    return get_cache().get_stats()
+
+
+@app.delete("/api/cache")
+def clear_cache():
+    """Clear the response cache."""
+    get_cache().invalidate()
+    return {"message": "Cache cleared"}
 
 
 # ── Health Check ──────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
+    cache = get_cache()
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
-        "version": "0.7.0",
+        "version": "0.8.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
         "agent_ready": agent is not None,
         "active_sessions": session_manager.active_count,
+        "cache_stats": cache.get_stats(),
         "features": [
-            "parallel_execution",
-            "conditional_routing",
-            "argument_extraction",
-            "conversation_memory",
-            "correlation_engine",
+            "parallel_execution", "conditional_routing", "argument_extraction",
+            "conversation_memory", "correlation_engine", "response_caching",
+            "structured_output",
         ],
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-# TfL Endpoints
+# Data Source Endpoints (unchanged)
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/tfl/tube-status")
 def get_tube_status():
     result = tfl_tool.get_tube_status()
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tfl/disruptions")
 def get_disruptions():
     result = tfl_tool.get_road_disruptions()
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tfl/road-status")
 def get_road_status(road_ids: str | None = Query(default=None)):
     result = tfl_tool.get_road_status(road_ids=road_ids)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tfl/summary")
 def get_tfl_summary():
@@ -303,30 +300,17 @@ def get_tfl_summary():
         "road_disruptions": {"success": disruptions.success, "summary": disruptions.summary},
     }
 
-
-# ══════════════════════════════════════════════════════════════════
-# Weather Endpoints
-# ══════════════════════════════════════════════════════════════════
-
 @app.get("/api/weather/current")
 def get_current_weather(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     result = weather_tool.get_current_weather(latitude=lat, longitude=lon)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/weather/forecast")
-def get_weather_forecast(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-    hours: int = Query(default=12, ge=1, le=48),
-):
+def get_weather_forecast(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), hours: int = Query(default=12, ge=1, le=48)):
     result = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=hours)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/weather/summary")
 def get_weather_summary(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
@@ -337,76 +321,40 @@ def get_weather_summary(lat: float = Query(default=51.5074), lon: float = Query(
         "forecast_6h": {"success": forecast.success, "summary": forecast.summary},
     }
 
-
-# ══════════════════════════════════════════════════════════════════
-# Air Quality Endpoints
-# ══════════════════════════════════════════════════════════════════
-
 @app.get("/api/air-quality/stations")
-def get_nearby_stations(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-    radius: int = Query(default=10000),
-):
+def get_nearby_stations(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), radius: int = Query(default=10000)):
     result = air_quality_tool.get_nearby_stations(latitude=lat, longitude=lon, radius_meters=radius)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/air-quality/latest")
-def get_air_quality_latest(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-    radius: int = Query(default=10000),
-):
+def get_air_quality_latest(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), radius: int = Query(default=10000)):
     result = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon, radius_meters=radius)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
-
-# ══════════════════════════════════════════════════════════════════
-# TomTom Endpoints
-# ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/tomtom/flow")
-def get_traffic_flow(
-    lat: float = Query(default=51.5074),
-    lon: float = Query(default=-0.1278),
-    name: str | None = Query(default=None),
-):
+def get_traffic_flow(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), name: str | None = Query(default=None)):
     result = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon, location_name=name)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tomtom/multi-flow")
 def get_multi_point_flow(points: str | None = Query(default=None)):
     point_list = points.split(",") if points else None
     result = tomtom_tool.get_multi_point_flow(points=point_list)
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tomtom/incidents")
 def get_traffic_incidents():
     result = tomtom_tool.get_traffic_incidents()
-    if not result.success:
-        raise HTTPException(status_code=502, detail=result.error)
+    if not result.success: raise HTTPException(status_code=502, detail=result.error)
     return result.model_dump()
-
 
 @app.get("/api/tomtom/points")
 def get_available_points():
     return TomTomTool.get_available_points()
-
-
-# ══════════════════════════════════════════════════════════════════
-# City Overview
-# ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/city/overview")
 def get_city_overview(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
@@ -421,8 +369,6 @@ def get_city_overview(lat: float = Query(default=51.5074), lon: float = Query(de
         "traffic_flow": {"success": traffic.success, "summary": traffic.summary},
     }
 
-
-# ── Run directly ──────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host=settings.API_HOST, port=settings.API_PORT, reload=settings.DEBUG)

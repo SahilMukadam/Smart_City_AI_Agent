@@ -1,16 +1,17 @@
 """
-Smart City AI Agent - LangGraph Agent (Day 7)
+Smart City AI Agent - LangGraph Agent (Day 8)
 Parallel execution + conditional routing + argument extraction +
-conversation memory + data correlation engine.
+conversation memory + correlation engine + response caching.
 
 Graph flow:
   START → router → [should_use_tools?]
-                      ├── yes → argument_extractor → tool_executor → correlator → analyzer → responder → END
+                      ├── yes → argument_extractor → tool_executor (cached) → correlator → analyzer → responder → END
                       └── no  → direct_responder → END
 """
 
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -22,12 +23,16 @@ from app.config import get_settings
 from app.agent.state import CityAgentState
 from app.agent.tools import ALL_TOOLS, TOOL_MAP
 from app.agent.correlation import correlate_data, format_insights_for_llm
+from app.agent.cache import ResponseCache
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────
 MAX_ITERATIONS = 3
 MAX_PARALLEL_WORKERS = 4
+
+# ── Module-level cache instance ───────────────────────────────────
+response_cache = ResponseCache()
 
 SYSTEM_PROMPT = """You are the Smart City AI Agent, an expert analyst for London city conditions.
 You have access to real-time data tools for:
@@ -111,7 +116,7 @@ Known London locations:
 Respond ONLY with a JSON object. Keys are tool names, values are argument dicts.
 If a tool needs no arguments or defaults are fine, use empty dict {{}}.
 If the user asks about a specific area, provide coordinates.
-If user asks to compare two locations with the same tool, use keys like "get_traffic_flow__1" and "get_traffic_flow__2".
+If user asks to compare two locations, use keys like "get_traffic_flow__1" and "get_traffic_flow__2".
 
 User question: {question}
 JSON arguments:"""
@@ -163,10 +168,6 @@ def _get_llm() -> ChatGoogleGenerativeAI:
     )
 
 
-# ══════════════════════════════════════════════════════════════════
-# Conversation Context Helper
-# ══════════════════════════════════════════════════════════════════
-
 def _build_conversation_context(messages: list) -> str:
     """Build conversation context from message history."""
     history = []
@@ -175,9 +176,7 @@ def _build_conversation_context(messages: list) -> str:
             if msg.type == "human":
                 history.append(f"User: {msg.content}")
             elif msg.type == "ai":
-                content = msg.content
-                if len(content) > 300:
-                    content = content[:300] + "..."
+                content = msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
                 history.append(f"Agent: {content}")
 
     if history and history[-1].startswith("User:"):
@@ -186,9 +185,7 @@ def _build_conversation_context(messages: list) -> str:
     if not history:
         return ""
 
-    context = "CONVERSATION HISTORY (previous exchanges):\n"
-    context += "\n".join(history[-6:])
-    return context
+    return "CONVERSATION HISTORY (previous exchanges):\n" + "\n".join(history[-6:])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -196,7 +193,7 @@ def _build_conversation_context(messages: list) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 def router_node(state: CityAgentState) -> dict:
-    """NODE 1: Router — context-aware tool selection."""
+    """NODE 1: Router."""
     logger.info("🔀 Router: Deciding which tools to call...")
 
     messages = state["messages"]
@@ -206,21 +203,14 @@ def router_node(state: CityAgentState) -> dict:
 
     try:
         llm = _get_llm()
-        prompt = ROUTER_PROMPT.format(
-            question=question,
-            conversation_context=conversation_context,
-        )
+        prompt = ROUTER_PROMPT.format(question=question, conversation_context=conversation_context)
         response = llm.invoke([HumanMessage(content=prompt)])
 
-        raw = response.content.strip()
-        raw = raw.replace("`", "").replace('"', "").replace("'", "")
+        raw = response.content.strip().replace("`", "").replace('"', "").replace("'", "")
 
         if raw.upper() == "NONE":
             logger.info("🔀 Router: No tools needed")
-            return {
-                "tools_to_call": [],
-                "iteration_count": state.get("iteration_count", 0) + 1,
-            }
+            return {"tools_to_call": [], "iteration_count": state.get("iteration_count", 0) + 1}
 
         tool_names = [t.strip() for t in raw.split(",") if t.strip()]
         valid_tools = [t for t in tool_names if t in TOOL_MAP]
@@ -230,10 +220,7 @@ def router_node(state: CityAgentState) -> dict:
             valid_tools = ["get_tube_status", "get_current_weather"]
 
         logger.info(f"🔀 Router selected tools: {valid_tools}")
-        return {
-            "tools_to_call": valid_tools,
-            "iteration_count": state.get("iteration_count", 0) + 1,
-        }
+        return {"tools_to_call": valid_tools, "iteration_count": state.get("iteration_count", 0) + 1}
 
     except Exception as e:
         logger.error(f"Router error: {e}")
@@ -245,16 +232,13 @@ def router_node(state: CityAgentState) -> dict:
 
 
 def argument_extractor_node(state: CityAgentState) -> dict:
-    """NODE 2: Argument Extractor — context-aware location inference."""
+    """NODE 2: Argument Extractor."""
     tools_to_call = state.get("tools_to_call", [])
     messages = state["messages"]
     last_message = messages[-1]
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
 
-    no_arg_tools = {
-        "get_tube_status", "get_road_disruptions",
-        "get_london_traffic_overview", "get_traffic_incidents",
-    }
+    no_arg_tools = {"get_tube_status", "get_road_disruptions", "get_london_traffic_overview", "get_traffic_incidents"}
     if all(t in no_arg_tools for t in tools_to_call):
         logger.info("🎯 Argument Extractor: All tools use defaults, skipping LLM call")
         return {"tool_arguments": {t: {} for t in tools_to_call}}
@@ -264,17 +248,14 @@ def argument_extractor_node(state: CityAgentState) -> dict:
     try:
         llm = _get_llm()
         prompt = ARGUMENT_PROMPT.format(
-            question=question,
-            tools=", ".join(tools_to_call),
+            question=question, tools=", ".join(tools_to_call),
             conversation_context=conversation_context,
         )
         response = llm.invoke([HumanMessage(content=prompt)])
 
         raw = response.content.strip()
         if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1]
-            raw = raw.rsplit("```", 1)[0]
-            raw = raw.strip()
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
         tool_args = json.loads(raw)
         logger.info(f"🎯 Argument Extractor: {tool_args}")
@@ -286,30 +267,60 @@ def argument_extractor_node(state: CityAgentState) -> dict:
 
 
 def tool_executor_node(state: CityAgentState) -> dict:
-    """NODE 3: Parallel Tool Executor."""
+    """
+    NODE 3: Parallel Tool Executor with caching.
+    Checks cache before making API calls. Caches successful responses.
+    Tracks per-tool timing and cache hit/miss for structured output.
+    """
     tool_args = state.get("tool_arguments", {})
     tools_to_call = state.get("tools_to_call", [])
     execution_plan = tool_args if tool_args else {t: {} for t in tools_to_call}
 
     total = len(execution_plan)
-    logger.info(f"🔧 Tool Executor: Calling {total} tools in parallel...")
+    logger.info(f"🔧 Tool Executor: Processing {total} tools...")
 
     results: dict[str, str] = {}
+    source_metadata: list[dict] = []
 
-    def _call_tool(tool_key: str, args: dict) -> tuple[str, str]:
+    def _call_tool(tool_key: str, args: dict) -> tuple[str, str, dict]:
+        """Call a tool with cache check. Returns (key, result, metadata)."""
         base_name = tool_key.split("__")[0]
         tool_func = TOOL_MAP.get(base_name)
+        meta = {"tool_name": tool_key, "success": False, "cached": False, "response_time_ms": 0, "error": None}
+
         if not tool_func:
-            return tool_key, f"ERROR: Unknown tool '{base_name}'"
+            meta["error"] = f"Unknown tool '{base_name}'"
+            return tool_key, f"ERROR: Unknown tool '{base_name}'", meta
+
+        # Check cache
+        cached = response_cache.get(tool_key, args)
+        if cached is not None:
+            meta["success"] = True
+            meta["cached"] = True
+            return tool_key, cached, meta
+
+        # Call the actual tool
         try:
-            logger.info(f"  📡 Calling {tool_key} with args: {args}")
+            start = time.perf_counter()
+            logger.info(f"  📡 Calling {tool_key}...")
             result = tool_func.invoke(args if args else {})
-            logger.info(f"  ✅ {tool_key} returned data")
-            return tool_key, result
+            elapsed = (time.perf_counter() - start) * 1000
+
+            meta["success"] = True
+            meta["response_time_ms"] = round(elapsed, 1)
+
+            # Cache the result
+            response_cache.set(tool_key, args, result)
+
+            logger.info(f"  ✅ {tool_key} ({elapsed:.0f}ms)")
+            return tool_key, result, meta
+
         except Exception as e:
             logger.error(f"  ❌ {tool_key} failed: {e}")
-            return tool_key, f"ERROR: {str(e)}"
+            meta["error"] = str(e)
+            return tool_key, f"ERROR: {str(e)}", meta
 
+    # Execute in parallel
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
         futures = {
             executor.submit(_call_tool, tk, args): tk
@@ -318,42 +329,50 @@ def tool_executor_node(state: CityAgentState) -> dict:
         for future in as_completed(futures):
             tk = futures[future]
             try:
-                key, result = future.result()
+                key, result, meta = future.result()
                 results[key] = result
+                source_metadata.append(meta)
             except Exception as e:
                 results[tk] = f"ERROR: {str(e)}"
+                source_metadata.append({
+                    "tool_name": tk, "success": False,
+                    "cached": False, "response_time_ms": 0, "error": str(e),
+                })
 
-    return {"tool_results": results}
+    return {"tool_results": results, "source_metadata": source_metadata}
 
 
 def correlator_node(state: CityAgentState) -> dict:
-    """
-    NODE 4: Correlator (NEW in Day 7)
-    Runs the correlation engine on tool results to find patterns
-    BEFORE the LLM analyzer sees the data.
-
-    This gives the LLM pre-computed insights to work with,
-    producing much richer and more accurate analysis.
-    """
+    """NODE 4: Correlator."""
     logger.info("📊 Correlator: Analyzing cross-source patterns...")
 
     tool_results = state.get("tool_results", {})
-
-    # Skip if we have no results or all failed
     successful = {k: v for k, v in tool_results.items() if not v.startswith("ERROR")}
+
     if len(successful) < 2:
-        logger.info("📊 Correlator: Less than 2 successful sources, skipping correlation")
-        return {"correlation_insights": ""}
+        logger.info("📊 Correlator: < 2 successful sources, skipping")
+        return {"correlation_insights": "", "parsed_insights": []}
 
     insights = correlate_data(tool_results)
     formatted = format_insights_for_llm(insights)
 
+    # Store parsed insights for structured API response
+    parsed = [
+        {
+            "type": i.insight_type.value,
+            "title": i.title,
+            "description": i.description,
+            "confidence": i.confidence.value,
+        }
+        for i in insights
+    ]
+
     logger.info(f"📊 Correlator: Generated {len(insights)} insight(s)")
-    return {"correlation_insights": formatted}
+    return {"correlation_insights": formatted, "parsed_insights": parsed}
 
 
 def analyzer_node(state: CityAgentState) -> dict:
-    """NODE 5: Analyzer — now receives correlation insights."""
+    """NODE 5: Analyzer."""
     logger.info("🧠 Analyzer: Correlating data...")
 
     messages = state["messages"]
@@ -364,9 +383,7 @@ def analyzer_node(state: CityAgentState) -> dict:
     conversation_context = _build_conversation_context(messages)
     correlation_insights = state.get("correlation_insights", "")
 
-    tool_data_parts = []
-    for tool_name, result in tool_results.items():
-        tool_data_parts.append(f"--- {tool_name} ---\n{result}")
+    tool_data_parts = [f"--- {name} ---\n{result}" for name, result in tool_results.items()]
     tool_data = "\n\n".join(tool_data_parts)
 
     try:
@@ -374,25 +391,18 @@ def analyzer_node(state: CityAgentState) -> dict:
         current_time = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         system = SYSTEM_PROMPT.format(current_time=current_time)
         analysis_prompt = ANALYSIS_PROMPT.format(
-            question=question,
-            tool_data=tool_data,
+            question=question, tool_data=tool_data,
             conversation_context=conversation_context,
-            correlation_insights=correlation_insights if correlation_insights else "No cross-source correlations detected.",
+            correlation_insights=correlation_insights or "No cross-source correlations detected.",
         )
 
-        response = llm.invoke([
-            SystemMessage(content=system),
-            HumanMessage(content=analysis_prompt),
-        ])
-
-        analysis = response.content.strip()
+        response = llm.invoke([SystemMessage(content=system), HumanMessage(content=analysis_prompt)])
         logger.info("🧠 Analyzer: Analysis complete")
-        return {"analysis": analysis}
+        return {"analysis": response.content.strip()}
 
     except Exception as e:
         logger.error(f"Analyzer error: {e}")
-        fallback = "I collected the following data but couldn't generate a full analysis:\n\n"
-        fallback += tool_data
+        fallback = "I collected the following data but couldn't generate a full analysis:\n\n" + tool_data
         if correlation_insights:
             fallback += f"\n\n{correlation_insights}"
         return {"analysis": fallback, "error": f"Analysis error: {str(e)}"}
@@ -406,11 +416,9 @@ def responder_node(state: CityAgentState) -> dict:
     tool_results = state.get("tool_results", {})
 
     response_parts = [analysis]
-
     successful_tools = [t for t, r in tool_results.items() if not r.startswith("ERROR")]
     if successful_tools:
-        sources = ", ".join(successful_tools)
-        response_parts.append(f"\n\n📊 *Data sources: {sources}*")
+        response_parts.append(f"\n\n📊 *Data sources: {', '.join(successful_tools)}*")
 
     return {"messages": [AIMessage(content="\n".join(response_parts))]}
 
@@ -426,21 +434,16 @@ def direct_responder_node(state: CityAgentState) -> dict:
 
     try:
         llm = _get_llm()
-        prompt = DIRECT_RESPONSE_PROMPT.format(
-            question=question,
-            conversation_context=conversation_context,
-        )
+        prompt = DIRECT_RESPONSE_PROMPT.format(question=question, conversation_context=conversation_context)
         response = llm.invoke([HumanMessage(content=prompt)])
-        text = response.content.strip()
+        return {"messages": [AIMessage(content=response.content.strip())]}
     except Exception as e:
         logger.error(f"Direct responder error: {e}")
-        text = (
+        return {"messages": [AIMessage(content=(
             "Hello! I'm the Smart City AI Agent for London. "
-            "I can help you with real-time traffic conditions, tube status, "
+            "I can help you with real-time traffic, tube status, "
             "weather, and air quality. What would you like to know?"
-        )
-
-    return {"messages": [AIMessage(content=text)]}
+        ))]}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -448,10 +451,7 @@ def direct_responder_node(state: CityAgentState) -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 def should_use_tools(state: CityAgentState) -> str:
-    tools = state.get("tools_to_call", [])
-    if tools:
-        return "argument_extractor"
-    return "direct_responder"
+    return "argument_extractor" if state.get("tools_to_call") else "direct_responder"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -459,14 +459,7 @@ def should_use_tools(state: CityAgentState) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 def build_agent_graph() -> StateGraph:
-    """
-    Build the LangGraph agent with correlation engine.
-
-    Flow:
-      START → router → [should_use_tools?]
-          ├── yes → argument_extractor → tool_executor → correlator → analyzer → responder → END
-          └── no  → direct_responder → END
-    """
+    """Build the 7-node agent graph with caching."""
     graph = StateGraph(CityAgentState)
 
     graph.add_node("router", router_node)
@@ -478,14 +471,10 @@ def build_agent_graph() -> StateGraph:
     graph.add_node("direct_responder", direct_responder_node)
 
     graph.add_edge(START, "router")
-    graph.add_conditional_edges(
-        "router",
-        should_use_tools,
-        {
-            "argument_extractor": "argument_extractor",
-            "direct_responder": "direct_responder",
-        },
-    )
+    graph.add_conditional_edges("router", should_use_tools, {
+        "argument_extractor": "argument_extractor",
+        "direct_responder": "direct_responder",
+    })
     graph.add_edge("argument_extractor", "tool_executor")
     graph.add_edge("tool_executor", "correlator")
     graph.add_edge("correlator", "analyzer")
@@ -494,10 +483,14 @@ def build_agent_graph() -> StateGraph:
     graph.add_edge("direct_responder", END)
 
     agent = graph.compile()
-    logger.info("✅ Agent graph compiled (7-node with correlation engine)")
-
+    logger.info("✅ Agent graph compiled (7-node with caching + correlation)")
     return agent
 
 
 def create_agent():
     return build_agent_graph()
+
+
+def get_cache() -> ResponseCache:
+    """Get the module-level response cache instance."""
+    return response_cache

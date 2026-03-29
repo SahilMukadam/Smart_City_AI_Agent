@@ -1,5 +1,5 @@
 """
-Smart City AI Agent - Agent State Definition (Day 7)
+Smart City AI Agent - Agent State Definition (Day 8)
 """
 
 from typing import Annotated
@@ -10,22 +10,18 @@ from langgraph.graph.message import add_messages
 class CityAgentState(TypedDict):
     """State that flows through the agent graph."""
 
-    # ── Conversation ──────────────────────────────────────────────
     messages: Annotated[list, add_messages]
-
-    # ── Tool Selection ────────────────────────────────────────────
     tools_to_call: list[str]
-
-    # ── Tool Arguments ────────────────────────────────────────────
     tool_arguments: dict[str, dict]
-
-    # ── Tool Results ──────────────────────────────────────────────
     tool_results: dict[str, str]
 
-    # ── Correlation Insights (Day 7) ──────────────────────────────
-    # Pre-computed cross-source insights from the correlation engine.
-    # Fed to the analyzer so the LLM can build on detected patterns.
+    # ── Source Metadata (Day 8) ───────────────────────────────────
+    # Per-tool timing, cache hits, and error info for structured output
+    source_metadata: list[dict]
+
+    # ── Correlation ───────────────────────────────────────────────
     correlation_insights: str
+    parsed_insights: list[dict]  # Structured insights for API response
 
     # ── Analysis ──────────────────────────────────────────────────
     analysis: str
