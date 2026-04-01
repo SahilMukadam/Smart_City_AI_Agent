@@ -1,7 +1,5 @@
 """
-Smart City AI Agent - Structured Response Models
-Rich response format for the agent API that includes confidence,
-source attribution, timing, and correlation insights.
+Smart City AI Agent - Structured Response Models (Day 9)
 """
 
 from datetime import datetime, timezone
@@ -9,7 +7,6 @@ from pydantic import BaseModel, Field
 
 
 class SourceInfo(BaseModel):
-    """Information about a single data source used."""
     tool_name: str
     success: bool
     cached: bool = False
@@ -18,60 +15,47 @@ class SourceInfo(BaseModel):
 
 
 class CorrelationInsight(BaseModel):
-    """A single correlation insight for the API response."""
     type: str
     title: str
     description: str
     confidence: str
 
 
+class AnomalyAlert(BaseModel):
+    """A detected anomaly for the API response."""
+    level: str  # info, warning, critical
+    category: str  # traffic, weather, air_quality, tube
+    title: str
+    description: str
+    metric: str
+    current_value: str
+    threshold: str
+    recommendation: str = ""
+
+
+class HealthScores(BaseModel):
+    """City health scores per category."""
+    overall: int | None = None
+    traffic: int | None = None
+    weather: int | None = None
+    air_quality: int | None = None
+    tube: int | None = None
+
+
 class AgentResponse(BaseModel):
-    """
-    Structured response from the agent.
-    This is what the frontend receives — rich metadata
-    alongside the analysis text.
-    """
-    # ── Core Response ─────────────────────────────────────────────
+    """Structured response from the agent."""
     response: str = Field(description="Agent's analysis and answer")
-    success: bool = Field(description="Whether the agent completed successfully")
+    success: bool
+    session_id: str
 
-    # ── Session ───────────────────────────────────────────────────
-    session_id: str = Field(description="Session ID for follow-up queries")
+    tools_used: list[str] = Field(default_factory=list)
+    sources: list[SourceInfo] = Field(default_factory=list)
 
-    # ── Tool Metadata ─────────────────────────────────────────────
-    tools_used: list[str] = Field(
-        default_factory=list,
-        description="Tools the agent selected",
-    )
-    sources: list[SourceInfo] = Field(
-        default_factory=list,
-        description="Detailed info about each data source",
-    )
+    insights: list[CorrelationInsight] = Field(default_factory=list)
+    anomalies: list[AnomalyAlert] = Field(default_factory=list)
+    health: HealthScores | None = None
 
-    # ── Correlation Insights ──────────────────────────────────────
-    insights: list[CorrelationInsight] = Field(
-        default_factory=list,
-        description="Cross-source correlation insights detected",
-    )
-
-    # ── Timing ────────────────────────────────────────────────────
-    total_time_ms: float = Field(
-        default=0.0,
-        description="Total request processing time in milliseconds",
-    )
-    timestamp: str = Field(
-        default_factory=lambda: datetime.now(tz=timezone.utc).isoformat(),
-        description="Response timestamp (UTC)",
-    )
-
-    # ── Error ─────────────────────────────────────────────────────
-    error: str | None = Field(
-        default=None,
-        description="Error message if something went wrong",
-    )
-
-    # ── Cache ─────────────────────────────────────────────────────
-    cache_stats: dict | None = Field(
-        default=None,
-        description="Cache hit/miss info for this request",
-    )
+    total_time_ms: float = 0.0
+    timestamp: str = Field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
+    error: str | None = None
+    cache_stats: dict | None = None

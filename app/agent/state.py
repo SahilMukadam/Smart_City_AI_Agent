@@ -1,5 +1,5 @@
 """
-Smart City AI Agent - Agent State Definition (Day 8)
+Smart City AI Agent - Agent State Definition (Day 9)
 """
 
 from typing import Annotated
@@ -15,13 +15,17 @@ class CityAgentState(TypedDict):
     tool_arguments: dict[str, dict]
     tool_results: dict[str, str]
 
-    # ── Source Metadata (Day 8) ───────────────────────────────────
-    # Per-tool timing, cache hits, and error info for structured output
+    # ── Source Metadata ───────────────────────────────────────────
     source_metadata: list[dict]
 
     # ── Correlation ───────────────────────────────────────────────
     correlation_insights: str
-    parsed_insights: list[dict]  # Structured insights for API response
+    parsed_insights: list[dict]
+
+    # ── Anomaly Detection (Day 9) ─────────────────────────────────
+    anomaly_alerts: str          # Formatted for LLM
+    parsed_anomalies: list[dict] # Structured for API response
+    health_scores: dict          # City health scores per category
 
     # ── Analysis ──────────────────────────────────────────────────
     analysis: str
