@@ -1,6 +1,6 @@
 """
 Smart City AI Agent - FastAPI Application
-Day 9: Anomaly detection + city health score + proactive insights.
+Day 11: Reasoning chain + example query library.
 """
 
 import time
@@ -18,6 +18,7 @@ from app.tools.air_quality import AirQualityTool
 from app.tools.tomtom import TomTomTool
 from app.agent.graph import create_agent, get_cache
 from app.agent.sessions import SessionManager
+from app.agent.reasoning import build_reasoning_steps, EXAMPLE_QUERIES
 from app.agent.response_models import (
     AgentResponse, SourceInfo, CorrelationInsight,
     AnomalyAlert, HealthScores,
@@ -37,20 +38,15 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME}")
     if settings.GEMINI_API_KEY:
         agent = create_agent()
-        logger.info("✅ Agent initialized (full intelligence layer)")
+        logger.info("✅ Agent initialized")
     else:
-        logger.warning("⚠️ GEMINI_API_KEY not set — agent disabled")
+        logger.warning("⚠️ GEMINI_API_KEY not set")
     yield
     logger.info("Shutting down.")
 
 
 settings = get_settings()
-app = FastAPI(
-    title=settings.APP_NAME,
-    description="An autonomous AI agent for London city data analysis",
-    version="0.9.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title=settings.APP_NAME, version="0.11.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 tfl_tool = TfLTool()
@@ -65,37 +61,59 @@ class ChatRequest(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════════
-# Agent Chat Endpoint
+# Agent Chat Endpoint (with reasoning steps)
 # ══════════════════════════════════════════════════════════════════
 
-@app.post("/api/agent/chat", response_model=AgentResponse)
+@app.post("/api/agent/chat")
 def agent_chat(request: ChatRequest):
-    """Send a question to the Smart City AI Agent."""
+    """Send a question to the agent. Returns structured response with reasoning steps."""
     if agent is None:
-        raise HTTPException(status_code=503, detail="Agent not available. Set GEMINI_API_KEY in .env")
+        raise HTTPException(status_code=503, detail="Agent not available")
 
     request_start = time.perf_counter()
     session = session_manager.get_or_create_session(request.session_id)
     session.add_user_message(request.message)
 
     try:
-        result = agent.invoke({
-            "messages": session.get_recent_messages(max_messages=10),
+        history_messages = session.get_recent_messages(max_messages=10)
+
+        initial_state = {
+            "messages": history_messages,
             "tools_to_call": [], "tool_arguments": {}, "tool_results": {},
             "source_metadata": [],
             "correlation_insights": "", "parsed_insights": [],
             "anomaly_alerts": "", "parsed_anomalies": [], "health_scores": {},
             "analysis": "", "iteration_count": 0, "error": "",
-        })
+        }
 
+        # Run with step-by-step streaming to capture node timings
+        node_order = []
+        node_timings = {}
+        current_state = initial_state
+
+        for step_output in agent.stream(initial_state, stream_mode="updates"):
+            for node_name, node_output in step_output.items():
+                step_start = time.perf_counter()
+                node_order.append(node_name)
+                # Merge output into current state for reasoning detail extraction
+                for key, value in node_output.items():
+                    current_state[key] = value
+                node_timings[node_name] = (time.perf_counter() - step_start) * 1000
+
+        # Build the final result from accumulated state
+        result = current_state
+
+        # Extract response
         messages = result.get("messages", [])
         ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
         response_text = ai_messages[-1].content if ai_messages else result.get("analysis", "No response.")
 
+        # Build reasoning steps
+        reasoning_steps = build_reasoning_steps(result, node_order, node_timings)
+
         sources = [SourceInfo(**m) for m in result.get("source_metadata", [])]
         insights = [CorrelationInsight(**i) for i in result.get("parsed_insights", [])]
         anomalies = [AnomalyAlert(**a) for a in result.get("parsed_anomalies", [])]
-
         raw_health = result.get("health_scores", {})
         health = HealthScores(**raw_health) if raw_health else None
 
@@ -104,74 +122,86 @@ def agent_chat(request: ChatRequest):
         session.add_tools_used(result.get("tools_to_call", []))
 
         cache = get_cache()
-        cache_hits = sum(1 for s in sources if s.cached)
 
-        return AgentResponse(
-            response=response_text, success=True, session_id=session.session_id,
-            tools_used=result.get("tools_to_call", []),
-            sources=sources, insights=insights, anomalies=anomalies, health=health,
-            total_time_ms=round(total_time, 1),
-            error=result.get("error") or None,
-            cache_stats={"hits": cache_hits, "global": cache.get_stats()},
-        )
+        return {
+            "response": response_text,
+            "success": True,
+            "session_id": session.session_id,
+            "tools_used": result.get("tools_to_call", []),
+            "sources": [s.model_dump() for s in sources],
+            "insights": [i.model_dump() for i in insights],
+            "anomalies": [a.model_dump() for a in anomalies],
+            "health": health.model_dump() if health else None,
+            "reasoning_steps": reasoning_steps,
+            "total_time_ms": round(total_time, 1),
+            "error": result.get("error") or None,
+            "cache_stats": {"global": cache.get_stats()},
+        }
 
     except Exception as e:
         logger.error(f"Agent error: {e}")
         total_time = (time.perf_counter() - request_start) * 1000
         error_msg = f"Sorry, I encountered an error: {str(e)}"
         session.add_ai_message(error_msg)
-        return AgentResponse(
-            response=error_msg, success=False, session_id=session.session_id,
-            total_time_ms=round(total_time, 1), error=str(e),
-        )
+        return {
+            "response": error_msg, "success": False,
+            "session_id": session.session_id,
+            "tools_used": [], "sources": [], "insights": [],
+            "anomalies": [], "health": None, "reasoning_steps": [],
+            "total_time_ms": round(total_time, 1), "error": str(e),
+            "cache_stats": {},
+        }
 
 
 # ══════════════════════════════════════════════════════════════════
-# Proactive City Insights Endpoint
+# Example Queries Endpoint
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/examples")
+def get_example_queries():
+    """Get curated example queries for the demo library."""
+    return EXAMPLE_QUERIES
+
+
+# ══════════════════════════════════════════════════════════════════
+# Proactive Insights
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/api/city/insights")
 def get_city_insights():
-    """
-    Proactive city insights — runs all data sources without a user question
-    and returns anomalies, correlations, and health scores.
-    
-    Uses ~2 Gemini API calls (router + analyzer).
-    Great for dashboards that want a periodic health check.
-    """
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not available")
-
     request_start = time.perf_counter()
-
     try:
-        result = agent.invoke({
-            "messages": [("user", "Give me a complete London city overview with all data sources. Check traffic, tube, weather, and air quality.")],
+        initial_state = {
+            "messages": [("user", "Full London city overview — traffic, tube, weather, and air quality")],
             "tools_to_call": [], "tool_arguments": {}, "tool_results": {},
             "source_metadata": [],
             "correlation_insights": "", "parsed_insights": [],
             "anomaly_alerts": "", "parsed_anomalies": [], "health_scores": {},
             "analysis": "", "iteration_count": 0, "error": "",
-        })
+        }
 
-        messages = result.get("messages", [])
+        current_state = initial_state
+        for step_output in agent.stream(initial_state, stream_mode="updates"):
+            for node_name, node_output in step_output.items():
+                for key, value in node_output.items():
+                    current_state[key] = value
+
+        messages = current_state.get("messages", [])
         ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
-        summary = ai_messages[-1].content if ai_messages else result.get("analysis", "")
-
-        total_time = (time.perf_counter() - request_start) * 1000
+        summary = ai_messages[-1].content if ai_messages else current_state.get("analysis", "")
 
         return {
             "summary": summary,
-            "health_scores": result.get("health_scores", {}),
-            "anomalies": result.get("parsed_anomalies", []),
-            "insights": result.get("parsed_insights", []),
-            "sources": result.get("source_metadata", []),
-            "tools_used": result.get("tools_to_call", []),
-            "total_time_ms": round(total_time, 1),
+            "health_scores": current_state.get("health_scores", {}),
+            "anomalies": current_state.get("parsed_anomalies", []),
+            "insights": current_state.get("parsed_insights", []),
+            "sources": current_state.get("source_metadata", []),
+            "tools_used": current_state.get("tools_to_call", []),
+            "total_time_ms": round((time.perf_counter() - request_start) * 1000, 1),
         }
-
     except Exception as e:
-        logger.error(f"Insights error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -189,30 +219,22 @@ def list_sessions():
 
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str):
-    session = session_manager.get_session(session_id)
-    if not session: raise HTTPException(status_code=404, detail="Session not found")
-    return session.get_summary()
+    s = session_manager.get_session(session_id)
+    if not s: raise HTTPException(status_code=404, detail="Session not found")
+    return s.get_summary()
 
 @app.get("/api/sessions/{session_id}/history")
 def get_session_history(session_id: str):
-    session = session_manager.get_session(session_id)
-    if not session: raise HTTPException(status_code=404, detail="Session not found")
-    return {"session_id": session_id, "messages": [
-        {"role": "user" if m.type == "human" else "assistant", "content": m.content}
-        for m in session.messages
-    ]}
+    s = session_manager.get_session(session_id)
+    if not s: raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, "messages": [{"role": "user" if m.type == "human" else "assistant", "content": m.content} for m in s.messages]}
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
-    if not session_manager.delete_session(session_id):
-        raise HTTPException(status_code=404, detail="Session not found")
+    if not session_manager.delete_session(session_id): raise HTTPException(status_code=404, detail="Session not found")
     return {"message": f"Session {session_id} deleted"}
 
-
-# ══════════════════════════════════════════════════════════════════
-# Cache Endpoints
-# ══════════════════════════════════════════════════════════════════
-
+# ── Cache ─────────────────────────────────────────────────────────
 @app.get("/api/cache/stats")
 def get_cache_stats():
     return get_cache().get_stats()
@@ -222,27 +244,16 @@ def clear_cache():
     get_cache().invalidate()
     return {"message": "Cache cleared"}
 
-
-# ══════════════════════════════════════════════════════════════════
-# Health Check
-# ══════════════════════════════════════════════════════════════════
-
+# ── Health ────────────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
     return {
-        "status": "healthy", "app": settings.APP_NAME, "version": "0.9.0",
+        "status": "healthy", "app": settings.APP_NAME, "version": "0.11.0",
         "tools_available": ["tfl", "weather", "air_quality", "tomtom"],
         "agent_ready": agent is not None,
         "active_sessions": session_manager.active_count,
         "cache_stats": get_cache().get_stats(),
-        "features": [
-            "parallel_execution", "conditional_routing", "argument_extraction",
-            "conversation_memory", "correlation_engine", "anomaly_detection",
-            "city_health_score", "response_caching", "structured_output",
-            "proactive_insights",
-        ],
     }
-
 
 # ══════════════════════════════════════════════════════════════════
 # Data Source Endpoints
@@ -266,11 +277,6 @@ def get_road_status(road_ids: str | None = Query(default=None)):
     if not r.success: raise HTTPException(status_code=502, detail=r.error)
     return r.model_dump()
 
-@app.get("/api/tfl/summary")
-def get_tfl_summary():
-    t = tfl_tool.get_tube_status(); d = tfl_tool.get_road_disruptions()
-    return {"tube_status": {"success": t.success, "summary": t.summary}, "road_disruptions": {"success": d.success, "summary": d.summary}}
-
 @app.get("/api/weather/current")
 def get_current_weather(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     r = weather_tool.get_current_weather(latitude=lat, longitude=lon)
@@ -280,18 +286,6 @@ def get_current_weather(lat: float = Query(default=51.5074), lon: float = Query(
 @app.get("/api/weather/forecast")
 def get_weather_forecast(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), hours: int = Query(default=12, ge=1, le=48)):
     r = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=hours)
-    if not r.success: raise HTTPException(status_code=502, detail=r.error)
-    return r.model_dump()
-
-@app.get("/api/weather/summary")
-def get_weather_summary(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
-    c = weather_tool.get_current_weather(latitude=lat, longitude=lon)
-    f = weather_tool.get_forecast(latitude=lat, longitude=lon, hours=6)
-    return {"current": {"success": c.success, "summary": c.summary, "data": c.data if c.success else None}, "forecast_6h": {"success": f.success, "summary": f.summary}}
-
-@app.get("/api/air-quality/stations")
-def get_nearby_stations(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278), radius: int = Query(default=10000)):
-    r = air_quality_tool.get_nearby_stations(latitude=lat, longitude=lon, radius_meters=radius)
     if not r.success: raise HTTPException(status_code=502, detail=r.error)
     return r.model_dump()
 
@@ -326,8 +320,7 @@ def get_available_points():
 @app.get("/api/city/overview")
 def get_city_overview(lat: float = Query(default=51.5074), lon: float = Query(default=-0.1278)):
     t = tfl_tool.get_tube_status(); w = weather_tool.get_current_weather(latitude=lat, longitude=lon)
-    a = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon)
-    tr = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon)
+    a = air_quality_tool.get_latest_readings(latitude=lat, longitude=lon); tr = tomtom_tool.get_traffic_flow(latitude=lat, longitude=lon)
     return {"tube": {"success": t.success, "summary": t.summary}, "weather": {"success": w.success, "summary": w.summary},
             "air_quality": {"success": a.success, "summary": a.summary}, "traffic_flow": {"success": tr.success, "summary": tr.summary}}
 
