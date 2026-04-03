@@ -6,6 +6,7 @@ uvicorn>=0.24.0
 
 # ── HTTP Client ───────────────────────────────────────────
 httpx>=0.25.0
+requests>=2.31.0
 
 # ── Config & Validation ──────────────────────────────────
 pydantic>=2.5.0
@@ -17,10 +18,11 @@ langgraph>=0.2.0
 langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
 
+# ── Frontend ──────────────────────────────────────────────
+streamlit>=1.29.0
+folium>=0.15.0
+streamlit-folium>=0.22.0
+plotly>=5.18.0
+
 # ── Testing ───────────────────────────────────────────────
 pytest>=7.4.0
-
-# ── Day 5+ (uncomment as needed) ─────────────────────────
-# folium>=0.15.0
-# plotly>=5.18.0
-# streamlit>=1.29.0

@@ -8,3 +8,6 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 1. the location should be selected based on the coordinates. the bbox should be able to be configured the the config or the .env file.
    I dont want there to be many places where i change the lat and lon 
 2. since this project is about london the config of lat and lon should be in one place...
+3. combine my previous project with this...
+4. make the formatting better
+5. show the traffic flow congestionns on the map
