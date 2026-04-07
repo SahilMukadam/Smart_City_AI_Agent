@@ -32,7 +32,7 @@ def _make_state(message: str, **overrides) -> dict:
 
 class TestToolDefinitions:
     def test_all_registered(self):
-        assert len(ALL_TOOLS) == 9
+        assert len(ALL_TOOLS) == 10
     def test_map_complete(self):
         for n in ["get_tube_status","get_current_weather","get_traffic_flow"]:
             assert n in TOOL_MAP
@@ -128,7 +128,7 @@ class TestResponderNode:
     def test_excludes_failed(self):
         state = _make_state("", analysis="Ok.", tool_results={"t1": "d", "t2": "ERROR: x"})
         content = responder_node(state)["messages"][0].content
-        assert "t1" in content and "t2" not in content
+        assert "T1" in content and "T2" not in content
 
 
 class TestGraphStructure:

@@ -154,6 +154,26 @@ def agent_chat(request: ChatRequest):
 
 
 # ══════════════════════════════════════════════════════════════════
+# Map Tile with real-time traffic overlay endpoint
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/config/map")
+def get_map_config():
+    """Return map tile URLs with API keys embedded (for frontend)."""
+    s = get_settings()
+    config = {
+        "center": [s.DEFAULT_LATITUDE, s.DEFAULT_LONGITUDE],
+        "default_zoom": 13,
+        "traffic_flow_url": None,
+        "traffic_incidents_url": None,
+    }
+    if s.TOMTOM_API_KEY:
+        base = "https://api.tomtom.com/traffic/map/4/tile"
+        config["traffic_flow_url"] = f"{base}/flow/absolute/{{z}}/{{x}}/{{y}}.png?key={s.TOMTOM_API_KEY}&tileSize=256"
+        config["traffic_incidents_url"] = f"{base}/incidents/s3/{{z}}/{{x}}/{{y}}.png?key={s.TOMTOM_API_KEY}&tileSize=256"
+    return config
+
+# ══════════════════════════════════════════════════════════════════
 # Example Queries Endpoint
 # ══════════════════════════════════════════════════════════════════
 

@@ -1,12 +1,8 @@
 """
-Smart City AI Agent - LangGraph Agent (Day 9)
-Full intelligence layer: parallel execution + conditional routing +
-argument extraction + memory + correlation + anomaly detection + caching.
-
-Graph flow:
-  START → router → [should_use_tools?]
-                      ├── yes → argument_extractor → tool_executor → correlator → analyzer → responder → END
-                      └── no  → direct_responder → END
+Smart City AI Agent - LangGraph Agent (Day 13)
+Features: parallel execution, conditional routing, argument extraction
+with geocoding, memory, correlation, anomaly detection, caching,
+markdown-formatted output.
 """
 
 import json
@@ -25,15 +21,13 @@ from app.agent.tools import ALL_TOOLS, TOOL_MAP
 from app.agent.correlation import CorrelationEngine, correlate_data, format_insights_for_llm
 from app.agent.anomaly import detect_anomalies, compute_city_health, format_anomalies_for_llm
 from app.agent.cache import ResponseCache
+from app.tools.geocoder import geocode_if_needed
 
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
 MAX_PARALLEL_WORKERS = 4
-
 response_cache = ResponseCache()
-
-# ── Shared correlation engine for data extraction ─────────────────
 _correlation_engine = CorrelationEngine()
 
 SYSTEM_PROMPT = """You are the Smart City AI Agent, an expert analyst for London city conditions.
@@ -42,6 +36,7 @@ You have access to real-time data tools for:
 - Weather: current conditions and forecasts (Open-Meteo)
 - Air Quality: pollution readings from monitoring stations (OpenAQ)
 - Traffic Flow: real-time speed and congestion data (TomTom)
+- Geocoding: resolve any London street, area, or landmark to coordinates
 
 Your job:
 1. Understand the user's question about London city conditions
@@ -49,18 +44,13 @@ Your job:
 3. Analyze the data you receive, looking for correlations and patterns
 4. Give a clear, insightful answer with specific data points
 
-Guidelines:
-- Always cite specific numbers (speeds, temperatures, AQI values)
-- Look for correlations: e.g., rain + rush hour → worse congestion
-- If data from one source is unavailable, work with what you have
-- Be concise but thorough. Lead with the key insight, then supporting data.
-- If anomaly alerts are present, address them prominently.
-- Current date/time: {current_time}
+Current date/time: {current_time}
 """
 
 ROUTER_PROMPT = """Based on the user's question and conversation history, decide which tools to call.
 
 Available tools:
+- geocode_location: Convert any London place name/street/address to coordinates
 - get_tube_status: London Underground line status and delays
 - get_road_disruptions: TfL road disruptions, roadworks, closures
 - get_road_corridor_status: Status of specific major roads (A1, A2, etc.)
@@ -72,10 +62,11 @@ Available tools:
 - get_traffic_incidents: Accidents, roadworks, jams from TomTom
 
 RULES:
-- If the user is just greeting you or asking a non-city question, respond with: NONE
-- Otherwise, return a comma-separated list of tool names. Choose the minimum set needed.
-- For follow-up questions, consider the CONVERSATION HISTORY to understand context.
-- For broad questions ("how's London?"), use: get_tube_status,get_current_weather,get_london_traffic_overview
+- If the user is just greeting you or asking a non-city question: NONE
+- If the user mentions a SPECIFIC street or area, include the relevant location-aware tools
+- You do NOT need to include geocode_location — location resolution is handled automatically
+- Choose the minimum set of tools needed
+- For broad queries ("how's London?"), use: get_tube_status,get_current_weather,get_london_traffic_overview
 
 {conversation_context}
 
@@ -90,25 +81,29 @@ Tools to call: {tools}
 
 {conversation_context}
 
-For each tool, decide what arguments to pass. Most tools default to Central London (51.5074, -0.1278).
+IMPORTANT: For location-specific queries, just provide the location_name.
+The system will automatically resolve it to coordinates.
+You do NOT need to know exact coordinates — just provide the place name.
 
 Available tool arguments:
-- get_traffic_flow: latitude (float), longitude (float), location_name (str)
-- get_current_weather: latitude (float), longitude (float)
+- get_traffic_flow: location_name (str, e.g., "Baker Street", "Brick Lane", "Canary Wharf")
+- get_current_weather: latitude (float), longitude (float) — or leave empty for defaults
 - get_weather_forecast: latitude (float), longitude (float), hours (int 1-48)
-- get_air_quality: latitude (float), longitude (float)
-- get_road_corridor_status: road_ids (str, comma-separated like "A1,A2")
-- get_tube_status, get_road_disruptions, get_london_traffic_overview, get_traffic_incidents: (no arguments)
+- get_air_quality: latitude (float), longitude (float) — or leave empty for defaults
+- get_road_corridor_status: road_ids (str, e.g., "A1,A2")
+- get_tube_status, get_road_disruptions, get_london_traffic_overview, get_traffic_incidents: no arguments
 
-Known London locations:
+Well-known locations (use these coordinates directly if mentioned):
 - Central London: 51.5074, -0.1278  |  City of London: 51.5155, -0.0922
 - Westminster: 51.4975, -0.1357     |  Camden: 51.5390, -0.1426
 - Tower Bridge: 51.5055, -0.0754    |  King's Cross: 51.5317, -0.1240
 - Canary Wharf: 51.5054, -0.0235    |  Shoreditch: 51.5274, -0.0777
 - Brixton: 51.4613, -0.1156         |  Hammersmith: 51.4927, -0.2248
 
-Respond ONLY with a JSON object. Keys are tool names, values are argument dicts.
-Use empty dict {{}} for defaults. Use suffixed keys for comparisons (e.g., "get_traffic_flow__1").
+For ANY OTHER location (streets, areas, landmarks), just provide location_name and leave coordinates out.
+For comparisons, use suffixed keys: "get_traffic_flow__1", "get_traffic_flow__2".
+
+Respond ONLY with a JSON object.
 
 User question: {question}
 JSON arguments:"""
@@ -128,22 +123,28 @@ Data collected from tools:
 
 City Health Score: {health_score}
 
-INSTRUCTIONS:
-1. If there are ANOMALY ALERTS, address them first — these are the most important findings.
-2. Use the correlation insights to explain WHY conditions are the way they are.
-3. Directly answer the user's question with specific data points.
-4. Reference the city health score to give an overall assessment.
-5. Include recommendations from anomaly alerts when relevant.
-6. Be concise — lead with the key insight, then supporting details."""
+FORMAT YOUR RESPONSE WITH CLEAR MARKDOWN:
+- Use ## for section headers (e.g., ## Traffic Conditions, ## Weather Impact)
+- Use **bold** for key numbers and status levels
+- Use bullet points (- ) for recommendations and lists
+- Lead with the most important finding as the first section
+- Keep it scannable — the user should get the key insight in 5 seconds
 
-DIRECT_RESPONSE_PROMPT = """You are the Smart City AI Agent for London. The user has sent a message
-that doesn't require any data tools.
+CONTENT GUIDELINES:
+1. If there are ANOMALY ALERTS, address them first prominently
+2. Use correlation insights to explain WHY conditions are the way they are
+3. Cite specific numbers (speeds, temperatures, AQI values)
+4. Reference the city health score for overall assessment
+5. Include actionable recommendations when relevant
+6. If this is a follow-up, reference conversation context"""
+
+DIRECT_RESPONSE_PROMPT = """You are the Smart City AI Agent for London.
 
 {conversation_context}
 
-Respond naturally. If they're greeting you, introduce yourself briefly and mention
-what you can help with (London traffic, weather, air quality, tube status).
-Keep it concise and friendly.
+Respond naturally and concisely. If greeting, mention you can help with:
+London traffic, tube status, weather, air quality — for ANY location in London.
+You can check specific streets, areas, landmarks, or give city-wide overviews.
 
 User message: {question}"""
 
@@ -195,7 +196,8 @@ def router_node(state: CityAgentState) -> dict:
         if raw.upper() == "NONE":
             return {"tools_to_call": [], "iteration_count": state.get("iteration_count", 0) + 1}
 
-        valid_tools = [t.strip() for t in raw.split(",") if t.strip() in TOOL_MAP]
+        # Filter out geocode_location — we handle it automatically in arg extractor
+        valid_tools = [t.strip() for t in raw.split(",") if t.strip() in TOOL_MAP and t.strip() != "geocode_location"]
         if not valid_tools:
             valid_tools = ["get_tube_status", "get_current_weather"]
 
@@ -212,6 +214,7 @@ def router_node(state: CityAgentState) -> dict:
 
 
 def argument_extractor_node(state: CityAgentState) -> dict:
+    """Extracts arguments and geocodes unknown locations automatically."""
     tools_to_call = state.get("tools_to_call", [])
     messages = state["messages"]
     last_message = messages[-1]
@@ -229,10 +232,19 @@ def argument_extractor_node(state: CityAgentState) -> dict:
             question=question, tools=", ".join(tools_to_call),
             conversation_context=conversation_context,
         ))])
+
         raw = response.content.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        return {"tool_arguments": json.loads(raw)}
+
+        tool_args = json.loads(raw)
+
+        # Geocode any locations that need resolution
+        tool_args = geocode_if_needed(tool_args)
+
+        logger.info(f"🎯 Argument Extractor (with geocoding): {tool_args}")
+        return {"tool_arguments": tool_args}
+
     except Exception as e:
         logger.warning(f"Argument extraction failed: {e}")
         return {"tool_arguments": {t: {} for t in tools_to_call}}
@@ -292,33 +304,17 @@ def tool_executor_node(state: CityAgentState) -> dict:
 
 
 def correlator_node(state: CityAgentState) -> dict:
-    """
-    NODE 4: Correlator + Anomaly Detection + Health Scoring.
-    Runs correlation engine, anomaly detector, and health scorer
-    on the tool results before the LLM sees them.
-    """
     logger.info("📊 Correlator: Analyzing patterns + anomalies...")
-
     tool_results = state.get("tool_results", {})
     successful = {k: v for k, v in tool_results.items() if not v.startswith("ERROR")}
 
     if not successful:
-        return {
-            "correlation_insights": "", "parsed_insights": [],
-            "anomaly_alerts": "", "parsed_anomalies": [],
-            "health_scores": {},
-        }
+        return {"correlation_insights": "", "parsed_insights": [], "anomaly_alerts": "", "parsed_anomalies": [], "health_scores": {}}
 
-    # Run correlation analysis
     insights = correlate_data(tool_results) if len(successful) >= 2 else []
     formatted_insights = format_insights_for_llm(insights)
-    parsed_insights = [
-        {"type": i.insight_type.value, "title": i.title,
-         "description": i.description, "confidence": i.confidence.value}
-        for i in insights
-    ]
+    parsed_insights = [{"type": i.insight_type.value, "title": i.title, "description": i.description, "confidence": i.confidence.value} for i in insights]
 
-    # Extract structured data for anomaly detection
     extracted = {
         "weather": _correlation_engine._extract_weather_data(tool_results),
         "traffic": _correlation_engine._extract_traffic_data(tool_results),
@@ -326,37 +322,26 @@ def correlator_node(state: CityAgentState) -> dict:
         "tube": _correlation_engine._extract_tube_data(tool_results),
     }
 
-    # Run anomaly detection
     anomalies = detect_anomalies(extracted)
     formatted_anomalies = format_anomalies_for_llm(anomalies)
     parsed_anomalies = [
-        {"level": a.level.value, "category": a.category, "title": a.title,
-         "description": a.description, "metric": a.metric,
-         "current_value": str(a.current_value), "threshold": str(a.threshold),
-         "recommendation": a.recommendation}
+        {"level": a.level.value, "category": a.category, "title": a.title, "description": a.description,
+         "metric": a.metric, "current_value": str(a.current_value), "threshold": str(a.threshold), "recommendation": a.recommendation}
         for a in anomalies
     ]
 
-    # Compute health scores
     health_scores = compute_city_health(extracted)
 
-    logger.info(
-        f"📊 Results: {len(insights)} insight(s), {len(anomalies)} anomalie(s), "
-        f"health: {health_scores.get('overall', 'N/A')}/100"
-    )
-
+    logger.info(f"📊 {len(insights)} insight(s), {len(anomalies)} anomalie(s), health: {health_scores.get('overall', 'N/A')}/100")
     return {
-        "correlation_insights": formatted_insights,
-        "parsed_insights": parsed_insights,
-        "anomaly_alerts": formatted_anomalies,
-        "parsed_anomalies": parsed_anomalies,
+        "correlation_insights": formatted_insights, "parsed_insights": parsed_insights,
+        "anomaly_alerts": formatted_anomalies, "parsed_anomalies": parsed_anomalies,
         "health_scores": health_scores,
     }
 
 
 def analyzer_node(state: CityAgentState) -> dict:
     logger.info("🧠 Analyzer: Generating analysis...")
-
     messages = state["messages"]
     last_message = messages[-1]
     question = last_message.content if hasattr(last_message, "content") else str(last_message)
@@ -400,19 +385,20 @@ def analyzer_node(state: CityAgentState) -> dict:
 
 
 def responder_node(state: CityAgentState) -> dict:
-    logger.info("💬 Responder: Formatting answer...")
     analysis = state.get("analysis", "No analysis available.")
     tool_results = state.get("tool_results", {})
 
     response_parts = [analysis]
     successful_tools = [t for t, r in tool_results.items() if not r.startswith("ERROR")]
     if successful_tools:
-        response_parts.append(f"\n\n📊 *Data sources: {', '.join(successful_tools)}*")
+        sources_str = ", ".join(t.replace("get_", "").replace("_", " ").title() for t in successful_tools)
+        response_parts.append(f"\n\n---\n📊 **Data sources:** {sources_str}")
 
     health = state.get("health_scores", {})
     overall = health.get("overall")
     if overall is not None:
-        response_parts.append(f"🏙️ *City health score: {overall}/100*")
+        emoji = "🟢" if overall >= 70 else ("🟡" if overall >= 40 else "🔴")
+        response_parts.append(f"{emoji} **City Health Score: {overall}/100**")
 
     return {"messages": [AIMessage(content="\n".join(response_parts))]}
 
@@ -432,7 +418,8 @@ def direct_responder_node(state: CityAgentState) -> dict:
     except Exception as e:
         return {"messages": [AIMessage(content=(
             "Hello! I'm the Smart City AI Agent for London. "
-            "I can help with real-time traffic, tube status, weather, and air quality."
+            "I can help with real-time traffic, tube status, weather, and air quality "
+            "for any location in London — just name a street, area, or landmark!"
         ))]}
 
 
@@ -442,7 +429,6 @@ def should_use_tools(state: CityAgentState) -> str:
 
 def build_agent_graph() -> StateGraph:
     graph = StateGraph(CityAgentState)
-
     graph.add_node("router", router_node)
     graph.add_node("argument_extractor", argument_extractor_node)
     graph.add_node("tool_executor", tool_executor_node)
@@ -464,7 +450,7 @@ def build_agent_graph() -> StateGraph:
     graph.add_edge("direct_responder", END)
 
     agent = graph.compile()
-    logger.info("✅ Agent graph compiled (7-node with anomaly detection)")
+    logger.info("✅ Agent graph compiled (geocoding + markdown formatting)")
     return agent
 
 

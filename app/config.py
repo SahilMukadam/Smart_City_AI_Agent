@@ -1,6 +1,6 @@
 """
 Smart City AI Agent - Configuration Management
-Uses pydantic-settings for type-safe environment variable loading.
+Single source of truth for all settings including location defaults.
 """
 
 from pydantic_settings import BaseSettings
@@ -16,29 +16,43 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
 
-    # ── TfL API (free, no key required for basic access) ─────────
-    TFL_BASE_URL: str = "https://api.tfl.gov.uk"
-    TFL_APP_KEY: str = ""  # Optional: higher rate limits with key
+    # ── Default Location (Central London) ─────────────────────────
+    # SINGLE SOURCE OF TRUTH for all default coordinates.
+    # Change these to adapt the agent for any city.
+    DEFAULT_LATITUDE: float = 51.5074
+    DEFAULT_LONGITUDE: float = -0.1278
+    DEFAULT_LOCATION_NAME: str = "Central London"
 
-    # ── TomTom API (Day 3) ───────────────────────────────────────
+    # ── Bounding Box (Greater London) ─────────────────────────────
+    # Used for: TomTom incidents, geocoding constraints, map bounds
+    BBOX_MIN_LAT: float = 51.28
+    BBOX_MIN_LON: float = -0.51
+    BBOX_MAX_LAT: float = 51.69
+    BBOX_MAX_LON: float = 0.33
+
+    # ── TfL API ───────────────────────────────────────────────────
+    TFL_BASE_URL: str = "https://api.tfl.gov.uk"
+    TFL_APP_KEY: str = ""
+
+    # ── TomTom API ────────────────────────────────────────────────
     TOMTOM_API_KEY: str = ""
     TOMTOM_BASE_URL: str = "https://api.tomtom.com"
 
-    # ── Open-Meteo (Day 2, free, no key needed) ──────────────────
+    # ── Open-Meteo ────────────────────────────────────────────────
     OPEN_METEO_BASE_URL: str = "https://api.open-meteo.com/v1"
 
-    # ── OpenAQ (Day 2, free, no key needed) ──────────────────────
+    # ── OpenAQ ────────────────────────────────────────────────────
     OPENAQ_BASE_URL: str = "https://api.openaq.org/v3"
     OPENAQ_API_KEY: str = ""
 
-    # ── Google Gemini (Day 4) ────────────────────────────────────
+    # ── Google Gemini ─────────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
 
-    # ── Cache Settings ───────────────────────────────────────────
-    CACHE_TTL_SECONDS: int = 300  # 5 min default TTL for API responses
+    # ── Cache Settings ────────────────────────────────────────────
+    CACHE_TTL_SECONDS: int = 300
 
-    # ── HTTP Client Settings ─────────────────────────────────────
+    # ── HTTP Client ───────────────────────────────────────────────
     HTTP_TIMEOUT_SECONDS: int = 15
     HTTP_MAX_RETRIES: int = 2
 
@@ -51,9 +65,4 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
-    """
-    Cached settings instance.
-    Call get_settings() anywhere to access config.
-    The lru_cache ensures we only load .env once.
-    """
     return Settings()

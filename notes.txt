@@ -5,10 +5,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 
 # to add changes at the end:
-1. the location should be selected based on the coordinates. the bbox should be able to be configured the the config or the .env file.
-   I dont want there to be many places where i change the lat and lon 
-2. since this project is about london the config of lat and lon should be in one place...
-3. combine my previous project with this...
-4. make the formatting better
-5. show the traffic flow congestionns on the map
-6. increase the map size
+1. the location should be selected based on the coordinates. the bbox should be able to be configured in the config or the .env file.
+   I dont want there to be many places where i change the lat and lon. keep one place where the lat, lon or the bbox will be mentioned and the values should be passed. 
+2. since this project is about london the config i am only restricted to 10 places where as i want it at any place or street on london. suggest me how we can do this 
+3. make the formatting better. i want the output with titles and headers so that it would be easy to read faster 
+4. show the traffic flow congestionns on the map. same like how google shows on the map based on coloured lines such that we know where it is red,yellow or green
+5. in the frontend i want you to increase the map size so that it is easy to use it 
+6. 
+combine my previous project with this...

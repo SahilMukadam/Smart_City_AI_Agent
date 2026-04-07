@@ -15,9 +15,6 @@ from app.models.schemas import ToolResponse
 
 logger = logging.getLogger(__name__)
 
-# ── London Default Coordinates ────────────────────────────────────
-LONDON_LAT = 51.5074
-LONDON_LON = -0.1278
 
 # ── AQI Breakpoints for PM2.5 (µg/m³) ───────────────────────────
 # Simplified US EPA AQI categories for PM2.5
@@ -77,8 +74,8 @@ class AirQualityTool(BaseTool):
 
     def get_nearby_stations(
         self,
-        latitude: float = LONDON_LAT,
-        longitude: float = LONDON_LON,
+        latitude: float = get_settings().DEFAULT_LATITUDE,
+        longitude: float = get_settings().DEFAULT_LONGITUDE,
         radius_meters: int = 10000,
         limit: int = 5,
     ) -> ToolResponse:
@@ -173,8 +170,8 @@ class AirQualityTool(BaseTool):
 
     def get_latest_readings(
         self,
-        latitude: float = LONDON_LAT,
-        longitude: float = LONDON_LON,
+        latitude: float = get_settings().DEFAULT_LATITUDE,
+        longitude: float = get_settings().DEFAULT_LONGITUDE,
         radius_meters: int = 10000,
         limit: int = 5,
     ) -> ToolResponse:
@@ -343,10 +340,10 @@ class AirQualityTool(BaseTool):
 
     @staticmethod
     def _get_location_label(latitude: float, longitude: float) -> str:
-        """Return 'Central London' for default coords, else lat/lon string."""
+        settings = get_settings()
         if (
-            abs(latitude - LONDON_LAT) < 0.01
-            and abs(longitude - LONDON_LON) < 0.01
+            abs(latitude - settings.DEFAULT_LATITUDE) < 0.01
+            and abs(longitude - settings.DEFAULT_LONGITUDE) < 0.01
         ):
-            return "Central London"
+            return settings.DEFAULT_LOCATION_NAME
         return f"({latitude:.4f}, {longitude:.4f})"

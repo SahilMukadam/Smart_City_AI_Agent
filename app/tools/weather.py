@@ -6,6 +6,7 @@ Open-Meteo API: https://open-meteo.com/en/docs (free, no key required)
 Provides: temperature, humidity, wind, precipitation, weather codes.
 """
 
+from app.config import get_settings
 import logging
 from datetime import datetime, timezone
 
@@ -49,10 +50,6 @@ WEATHER_CODES: dict[int, str] = {
     99: "Thunderstorm with heavy hail",
 }
 
-# ── London Default Coordinates ────────────────────────────────────
-LONDON_LAT = 51.5074
-LONDON_LON = -0.1278
-
 
 class WeatherTool(BaseTool):
     """
@@ -87,8 +84,8 @@ class WeatherTool(BaseTool):
 
     def get_current_weather(
         self,
-        latitude: float = LONDON_LAT,
-        longitude: float = LONDON_LON,
+        latitude: float = get_settings().DEFAULT_LATITUDE,
+        longitude: float = get_settings().DEFAULT_LONGITUDE,
     ) -> ToolResponse:
         """
         Fetch current weather conditions for a location.
@@ -186,8 +183,8 @@ class WeatherTool(BaseTool):
 
     def get_forecast(
         self,
-        latitude: float = LONDON_LAT,
-        longitude: float = LONDON_LON,
+        latitude: float = get_settings().DEFAULT_LATITUDE,
+        longitude: float = get_settings().DEFAULT_LONGITUDE,
         hours: int = 12,
     ) -> ToolResponse:
         """
@@ -317,10 +314,10 @@ class WeatherTool(BaseTool):
 
     @staticmethod
     def _get_location_label(latitude: float, longitude: float) -> str:
-        """Return 'Central London' for default coords, else lat/lon string."""
+        settings = get_settings()
         if (
-            abs(latitude - LONDON_LAT) < 0.01
-            and abs(longitude - LONDON_LON) < 0.01
+            abs(latitude - settings.DEFAULT_LATITUDE) < 0.01
+            and abs(longitude - settings.DEFAULT_LONGITUDE) < 0.01
         ):
-            return "Central London"
+            return settings.DEFAULT_LOCATION_NAME
         return f"({latitude:.4f}, {longitude:.4f})"

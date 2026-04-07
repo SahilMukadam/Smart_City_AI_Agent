@@ -31,12 +31,11 @@ LONDON_POINTS = {
 }
 
 # ── London Bounding Box (for incidents) ───────────────────────────
-LONDON_BBOX = {
-    "min_lat": 51.28,
-    "min_lon": -0.51,
-    "max_lat": 51.69,
-    "max_lon": 0.33,
-}
+from app.config import get_settings as _get_cfg
+def _get_bbox():
+    s = _get_cfg()
+    return {"min_lat": s.BBOX_MIN_LAT, "min_lon": s.BBOX_MIN_LON, "max_lat": s.BBOX_MAX_LAT, "max_lon": s.BBOX_MAX_LON}
+
 
 # ── Congestion Level Interpretation ───────────────────────────────
 def _classify_congestion(ratio: float) -> str:
@@ -304,10 +303,10 @@ class TomTomTool(BaseTool):
 
     def get_traffic_incidents(
         self,
-        min_lat: float = LONDON_BBOX["min_lat"],
-        min_lon: float = LONDON_BBOX["min_lon"],
-        max_lat: float = LONDON_BBOX["max_lat"],
-        max_lon: float = LONDON_BBOX["max_lon"],
+        min_lat: float = _get_bbox()["min_lat"],
+        min_lon: float = _get_bbox()["min_lon"],
+        max_lat: float = _get_bbox()["max_lat"],
+        max_lon: float = _get_bbox()["max_lon"],
     ) -> ToolResponse:
         """
         Fetch traffic incidents (accidents, roadworks, closures) in a bounding box.
