@@ -2,7 +2,7 @@
 
 An autonomous AI agent that answers questions about London city conditions by intelligently querying multiple real-time data sources, correlating patterns, detecting anomalies, and generating insightful analysis.
 
-**Ask about any location in London** — streets, areas, landmarks — and the agent autonomously decides which APIs to call, fetches data in parallel, detects correlations (e.g., rain causing congestion), flags anomalies, and responds with a structured analysis.
+**Ask about any location in London** - streets, areas, landmarks - and the agent autonomously decides which APIs to call, fetches data in parallel, detects correlations (e.g., rain causing congestion), flags anomalies, and responds with a structured analysis.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Agent_Framework-green)
@@ -16,16 +16,16 @@ An autonomous AI agent that answers questions about London city conditions by in
 
 ### Autonomous Agent
 - **LangGraph state machine** with 7-node reasoning pipeline
-- **Parallel tool execution** — calls multiple APIs simultaneously via ThreadPoolExecutor
-- **Conditional routing** — greetings skip the tool pipeline entirely
-- **Conversation memory** — session-based context for follow-up questions
-- **Argument extraction with geocoding** — resolves any London address to coordinates via Nominatim
+- **Parallel tool execution** - calls multiple APIs simultaneously via ThreadPoolExecutor
+- **Conditional routing** - greetings skip the tool pipeline entirely
+- **Conversation memory** - session-based context for follow-up questions
+- **Argument extraction with geocoding** - resolves any London address to coordinates via Nominatim
 
 ### Intelligence Layer
-- **Correlation engine** — cross-analyzes traffic × weather × air quality patterns
-- **Anomaly detection** — threshold-based alerts (🚨 critical, ⚠️ warning, ℹ️ info)
-- **City health score** — composite 0–100 score across traffic, tube, weather, air quality
-- **Proactive insights** — endpoint that generates a full city report without a user question
+- **Correlation engine** - cross-analyzes traffic × weather × air quality patterns
+- **Anomaly detection** - threshold-based alerts (🚨 critical, ⚠️ warning, ℹ️ info)
+- **City health score** - composite 0–100 score across traffic, tube, weather, air quality
+- **Proactive insights** - endpoint that generates a full city report without a user question
 
 ### Real-Time Data Sources
 | Source | API | Data |
@@ -37,12 +37,12 @@ An autonomous AI agent that answers questions about London city conditions by in
 | Geocoding | Nominatim/OSM (free) | Any London address → coordinates |
 
 ### Frontend Dashboard
-- **Split-view layout** — chat (left) + live map & insights (right)
-- **Live reasoning chain** — watch the agent think step-by-step as it processes
-- **TomTom traffic flow tiles** — red/yellow/green overlay on the map
-- **Health gauge** — Plotly gauge with per-category sub-scores
-- **Anomaly alert cards** — color-coded with recommendations
-- **Glassmorphism UI** — dark theme with blur effects
+- **Split-view layout** - chat (left) + live map & insights (right)
+- **Live reasoning chain** - watch the agent think step-by-step as it processes
+- **TomTom traffic flow tiles** - red/yellow/green overlay on the map
+- **Health gauge** - Plotly gauge with per-category sub-scores
+- **Anomaly alert cards** - color-coded with recommendations
+- **Glassmorphism UI** - dark theme with blur effects
 
 ---
 
@@ -260,8 +260,8 @@ Smart_City_AI_Agent/
 
 This project demonstrates:
 
-1. **AI Agent Architecture** — LangGraph state machine with conditional routing, parallel execution, and conversation memory
-2. **System Design** — Clean separation of data layer (tool wrappers), intelligence layer (correlation + anomaly detection), and presentation layer (Streamlit)
-3. **Production Patterns** — Response caching, graceful degradation, structured error handling, comprehensive testing (250+ tests)
-4. **Data Engineering** — Multi-source data ingestion, standardized schemas, cross-source correlation
-5. **Full-Stack Development** — FastAPI backend + Streamlit frontend with real-time UX (live reasoning chain, traffic map tiles)
+1. **AI Agent Architecture** - LangGraph state machine with conditional routing, parallel execution, and conversation memory
+2. **System Design** - Clean separation of data layer (tool wrappers), intelligence layer (correlation + anomaly detection), and presentation layer (Streamlit)
+3. **Production Patterns** - Response caching, graceful degradation, structured error handling, comprehensive testing (250+ tests)
+4. **Data Engineering** - Multi-source data ingestion, standardized schemas, cross-source correlation
+5. **Full-Stack Development** - FastAPI backend + Streamlit frontend with real-time UX (live reasoning chain, traffic map tiles)
